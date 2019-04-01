@@ -10,20 +10,20 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog"
 )
 
 type pollingObserver struct {
 	interval time.Duration
-	reactors map[string][]reactorFn
+	reactors map[string][]ReactorFn
 	files    map[string]string
 
 	reactorsMutex sync.RWMutex
 }
 
 // AddReactor will add new reactor to this observer.
-func (o *pollingObserver) AddReactor(reaction reactorFn, startingFileContent map[string][]byte, files ...string) Observer {
+func (o *pollingObserver) AddReactor(reaction ReactorFn, startingFileContent map[string][]byte, files ...string) Observer {
 	o.reactorsMutex.Lock()
 	defer o.reactorsMutex.Unlock()
 	for _, f := range files {
@@ -37,13 +37,23 @@ func (o *pollingObserver) AddReactor(reaction reactorFn, startingFileContent map
 		var err error
 
 		if startingContent, ok := startingFileContent[f]; ok {
-			glog.V(3).Infof("Starting from specified content for file %q", f)
+			klog.V(3).Infof("Starting from specified content for file %q", f)
+			// if empty starting content is specified, do not hash the empty string but just return it the same
+			// way as calculateFileHash() does in that case.
+			// in case the file exists and is empty, we don't care about the initial content anyway, because we
+			// are only going to react when the file content change.
+			// in case the file does not exists but empty string is specified as initial content, without this
+			// the content will be hashed and reaction will trigger as if the content changed.
+			if len(startingContent) == 0 {
+				o.files[f] = ""
+				continue
+			}
 			o.files[f], err = calculateHash(bytes.NewBuffer(startingContent))
 			if err != nil {
 				panic(fmt.Sprintf("unexpected error while adding reactor for %#v: %v", files, err))
 			}
 		} else {
-			glog.V(3).Infof("Adding reactor for file %q", f)
+			klog.V(3).Infof("Adding reactor for file %q", f)
 			o.files[f], err = calculateFileHash(f)
 			if err != nil {
 				panic(fmt.Sprintf("unexpected error while adding reactor for %#v: %v", files, err))
@@ -75,7 +85,7 @@ func (o *pollingObserver) processReactors(stopCh <-chan struct{}) {
 				continue
 			}
 
-			glog.Infof("Observed change: file:%s (current: %q, lastKnown: %q)", filename, currentHash, lastKnownHash)
+			klog.Infof("Observed change: file:%s (current: %q, lastKnown: %q)", filename, currentHash, lastKnownHash)
 			o.files[filename] = currentHash
 
 			for i := range reactors {
@@ -90,21 +100,21 @@ func (o *pollingObserver) processReactors(stopCh <-chan struct{}) {
 				}
 
 				if err := reactors[i](filename, action); err != nil {
-					glog.Errorf("Reactor for %q failed: %v", filename, err)
+					klog.Errorf("Reactor for %q failed: %v", filename, err)
 				}
 			}
 		}
 		return false, nil
 	})
 	if err != nil {
-		glog.Fatalf("file observer failed: %v", err)
+		klog.Fatalf("file observer failed: %v", err)
 	}
 }
 
 // Run will start a new observer.
 func (o *pollingObserver) Run(stopChan <-chan struct{}) {
-	glog.Info("Starting file observer")
-	defer glog.Infof("Shutting down file observer")
+	klog.Info("Starting file observer")
+	defer klog.Infof("Shutting down file observer")
 	o.processReactors(stopChan)
 }
 

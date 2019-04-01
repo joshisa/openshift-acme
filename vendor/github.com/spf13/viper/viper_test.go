@@ -8,12 +8,12 @@ package viper
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -63,6 +63,11 @@ title = "TOML Example"
 organization = "MongoDB"
 Bio = "MongoDB Chief Developer Advocate & Hacker at Large"
 dob = 1979-05-27T07:32:00Z # First class dates? Why not?`)
+
+var dotenvExample = []byte(`
+TITLE_DOTENV="DotEnv Example"
+TYPE_DOTENV=donut
+NAME_DOTENV=Cake`)
 
 var jsonExample = []byte(`{
 "id": "0001",
@@ -136,6 +141,10 @@ func initConfigs() {
 	r = bytes.NewReader(tomlExample)
 	unmarshalReader(r, v.config)
 
+	SetConfigType("env")
+	r = bytes.NewReader(dotenvExample)
+	unmarshalReader(r, v.config)
+
 	SetConfigType("json")
 	remote := bytes.NewReader(remoteExample)
 	unmarshalReader(remote, v.kvstore)
@@ -179,6 +188,14 @@ func initTOML() {
 	unmarshalReader(r, v.config)
 }
 
+func initDotEnv() {
+	Reset()
+	SetConfigType("env")
+	r := bytes.NewReader(dotenvExample)
+
+	unmarshalReader(r, v.config)
+}
+
 func initHcl() {
 	Reset()
 	SetConfigType("hcl")
@@ -191,11 +208,16 @@ func initHcl() {
 func initDirs(t *testing.T) (string, string, func()) {
 
 	var (
-		testDirs = []string{`a a`, `b`, `c\c`, `D_`}
+		testDirs = []string{`a a`, `b`, `C_`}
 		config   = `improbable`
 	)
 
+	if runtime.GOOS != "windows" {
+		testDirs = append(testDirs, `d\d`)
+	}
+
 	root, err := ioutil.TempDir("", "")
+	require.NoError(t, err, "Failed to create temporary directory")
 
 	cleanup := true
 	defer func() {
@@ -208,7 +230,7 @@ func initDirs(t *testing.T) (string, string, func()) {
 	assert.Nil(t, err)
 
 	err = os.Chdir(root)
-	assert.Nil(t, err)
+	require.Nil(t, err)
 
 	for _, dir := range testDirs {
 		err = os.Mkdir(dir, 0750)
@@ -228,7 +250,7 @@ func initDirs(t *testing.T) (string, string, func()) {
 	}
 }
 
-//stubs for PFlag Values
+// stubs for PFlag Values
 type stringValue string
 
 func newStringValue(val string, p *string) *stringValue {
@@ -246,7 +268,7 @@ func (s *stringValue) Type() string {
 }
 
 func (s *stringValue) String() string {
-	return fmt.Sprintf("%s", *s)
+	return string(*s)
 }
 
 func TestBasics(t *testing.T) {
@@ -342,6 +364,11 @@ func TestTOML(t *testing.T) {
 	assert.Equal(t, "TOML Example", Get("title"))
 }
 
+func TestDotEnv(t *testing.T) {
+	initDotEnv()
+	assert.Equal(t, "DotEnv Example", Get("title_dotenv"))
+}
+
 func TestHCL(t *testing.T) {
 	initHcl()
 	assert.Equal(t, "0001", Get("id"))
@@ -394,7 +421,10 @@ func TestEmptyEnv(t *testing.T) {
 	BindEnv("type") // Empty environment variable
 	BindEnv("name") // Bound, but not set environment variable
 
-	os.Clearenv()
+	os.Unsetenv("type")
+	os.Unsetenv("TYPE")
+	os.Unsetenv("name")
+	os.Unsetenv("NAME")
 
 	os.Setenv("TYPE", "")
 
@@ -410,7 +440,10 @@ func TestEmptyEnv_Allowed(t *testing.T) {
 	BindEnv("type") // Empty environment variable
 	BindEnv("name") // Bound, but not set environment variable
 
-	os.Clearenv()
+	os.Unsetenv("type")
+	os.Unsetenv("TYPE")
+	os.Unsetenv("name")
+	os.Unsetenv("NAME")
 
 	os.Setenv("TYPE", "")
 
@@ -470,12 +503,92 @@ func TestSetEnvKeyReplacer(t *testing.T) {
 func TestAllKeys(t *testing.T) {
 	initConfigs()
 
-	ks := sort.StringSlice{"title", "newkey", "owner.organization", "owner.dob", "owner.bio", "name", "beard", "ppu", "batters.batter", "hobbies", "clothing.jacket", "clothing.trousers", "clothing.pants.size", "age", "hacker", "id", "type", "eyes", "p_id", "p_ppu", "p_batters.batter.type", "p_type", "p_name", "foos"}
+	ks := sort.StringSlice{
+		"title",
+		"newkey",
+		"owner.organization",
+		"owner.dob",
+		"owner.bio",
+		"name",
+		"beard",
+		"ppu",
+		"batters.batter",
+		"hobbies",
+		"clothing.jacket",
+		"clothing.trousers",
+		"clothing.pants.size",
+		"age",
+		"hacker",
+		"id",
+		"type",
+		"eyes",
+		"p_id",
+		"p_ppu",
+		"p_batters.batter.type",
+		"p_type",
+		"p_name",
+		"foos",
+		"title_dotenv",
+		"type_dotenv",
+		"name_dotenv",
+	}
 	dob, _ := time.Parse(time.RFC3339, "1979-05-27T07:32:00Z")
-	all := map[string]interface{}{"owner": map[string]interface{}{"organization": "MongoDB", "bio": "MongoDB Chief Developer Advocate & Hacker at Large", "dob": dob}, "title": "TOML Example", "ppu": 0.55, "eyes": "brown", "clothing": map[string]interface{}{"trousers": "denim", "jacket": "leather", "pants": map[string]interface{}{"size": "large"}}, "id": "0001", "batters": map[string]interface{}{"batter": []interface{}{map[string]interface{}{"type": "Regular"}, map[string]interface{}{"type": "Chocolate"}, map[string]interface{}{"type": "Blueberry"}, map[string]interface{}{"type": "Devil's Food"}}}, "hacker": true, "beard": true, "hobbies": []interface{}{"skateboarding", "snowboarding", "go"}, "age": 35, "type": "donut", "newkey": "remote", "name": "Cake", "p_id": "0001", "p_ppu": "0.55", "p_name": "Cake", "p_batters": map[string]interface{}{"batter": map[string]interface{}{"type": "Regular"}}, "p_type": "donut", "foos": []map[string]interface{}{map[string]interface{}{"foo": []map[string]interface{}{map[string]interface{}{"key": 1}, map[string]interface{}{"key": 2}, map[string]interface{}{"key": 3}, map[string]interface{}{"key": 4}}}}}
+	all := map[string]interface{}{
+		"owner": map[string]interface{}{
+			"organization": "MongoDB",
+			"bio":          "MongoDB Chief Developer Advocate & Hacker at Large",
+			"dob":          dob,
+		},
+		"title": "TOML Example",
+		"ppu":   0.55,
+		"eyes":  "brown",
+		"clothing": map[string]interface{}{
+			"trousers": "denim",
+			"jacket":   "leather",
+			"pants":    map[string]interface{}{"size": "large"},
+		},
+		"id": "0001",
+		"batters": map[string]interface{}{
+			"batter": []interface{}{
+				map[string]interface{}{"type": "Regular"},
+				map[string]interface{}{"type": "Chocolate"},
+				map[string]interface{}{"type": "Blueberry"},
+				map[string]interface{}{"type": "Devil's Food"},
+			},
+		},
+		"hacker": true,
+		"beard":  true,
+		"hobbies": []interface{}{
+			"skateboarding",
+			"snowboarding",
+			"go",
+		},
+		"age":    35,
+		"type":   "donut",
+		"newkey": "remote",
+		"name":   "Cake",
+		"p_id":   "0001",
+		"p_ppu":  "0.55",
+		"p_name": "Cake",
+		"p_batters": map[string]interface{}{
+			"batter": map[string]interface{}{"type": "Regular"},
+		},
+		"p_type": "donut",
+		"foos": []map[string]interface{}{
+			{
+				"foo": []map[string]interface{}{
+					{"key": 1},
+					{"key": 2},
+					{"key": 3},
+					{"key": 4}},
+			},
+		},
+		"title_dotenv": "DotEnv Example",
+		"type_dotenv":  "donut",
+		"name_dotenv":  "Cake",
+	}
 
-	var allkeys sort.StringSlice
-	allkeys = AllKeys()
+	allkeys := sort.StringSlice(AllKeys())
 	allkeys.Sort()
 	ks.Sort()
 
@@ -516,11 +629,13 @@ func TestUnmarshal(t *testing.T) {
 	SetDefault("port", 1313)
 	Set("name", "Steve")
 	Set("duration", "1s1ms")
+	Set("modes", []int{1, 2, 3})
 
 	type config struct {
 		Port     int
 		Name     string
 		Duration time.Duration
+		Modes    []int
 	}
 
 	var C config
@@ -530,14 +645,33 @@ func TestUnmarshal(t *testing.T) {
 		t.Fatalf("unable to decode into struct, %v", err)
 	}
 
-	assert.Equal(t, &config{Name: "Steve", Port: 1313, Duration: time.Second + time.Millisecond}, &C)
+	assert.Equal(
+		t,
+		&config{
+			Name:     "Steve",
+			Port:     1313,
+			Duration: time.Second + time.Millisecond,
+			Modes:    []int{1, 2, 3},
+		},
+		&C,
+	)
 
 	Set("port", 1234)
 	err = Unmarshal(&C)
 	if err != nil {
 		t.Fatalf("unable to decode into struct, %v", err)
 	}
-	assert.Equal(t, &config{Name: "Steve", Port: 1234, Duration: time.Second + time.Millisecond}, &C)
+
+	assert.Equal(
+		t,
+		&config{
+			Name:     "Steve",
+			Port:     1234,
+			Duration: time.Second + time.Millisecond,
+			Modes:    []int{1, 2, 3},
+		},
+		&C,
+	)
 }
 
 func TestUnmarshalWithDecoderOptions(t *testing.T) {
@@ -658,6 +792,51 @@ func TestBindPFlagsStringSlice(t *testing.T) {
 	}
 }
 
+func TestBindPFlagsIntSlice(t *testing.T) {
+	tests := []struct {
+		Expected []int
+		Value    string
+	}{
+		{nil, ""},
+		{[]int{1}, "1"},
+		{[]int{2, 3}, "2,3"},
+	}
+
+	v := New() // create independent Viper object
+	defaultVal := []int{0}
+	v.SetDefault("intslice", defaultVal)
+
+	for _, testValue := range tests {
+		flagSet := pflag.NewFlagSet("test", pflag.ContinueOnError)
+		flagSet.IntSlice("intslice", testValue.Expected, "test")
+
+		for _, changed := range []bool{true, false} {
+			flagSet.VisitAll(func(f *pflag.Flag) {
+				f.Value.Set(testValue.Value)
+				f.Changed = changed
+			})
+
+			err := v.BindPFlags(flagSet)
+			if err != nil {
+				t.Fatalf("error binding flag set, %v", err)
+			}
+
+			type TestInt struct {
+				IntSlice []int
+			}
+			val := &TestInt{}
+			if err := v.Unmarshal(val); err != nil {
+				t.Fatalf("%+#v cannot unmarshal: %s", testValue.Value, err)
+			}
+			if changed {
+				assert.Equal(t, testValue.Expected, val.IntSlice)
+			} else {
+				assert.Equal(t, defaultVal, val.IntSlice)
+			}
+		}
+	}
+}
+
 func TestBindPFlag(t *testing.T) {
 	var testString = "testing"
 	var testValue = newStringValue(testString, &testString)
@@ -673,7 +852,7 @@ func TestBindPFlag(t *testing.T) {
 	assert.Equal(t, testString, Get("testvalue"))
 
 	flag.Value.Set("testing_mutate")
-	flag.Changed = true //hack for pflag usage
+	flag.Changed = true // hack for pflag usage
 
 	assert.Equal(t, "testing_mutate", Get("testvalue"))
 
@@ -756,8 +935,11 @@ func TestFindsNestedKeys(t *testing.T) {
 		"hobbies": []interface{}{
 			"skateboarding", "snowboarding", "go",
 		},
-		"title":  "TOML Example",
-		"newkey": "remote",
+		"TITLE_DOTENV": "DotEnv Example",
+		"TYPE_DOTENV":  "donut",
+		"NAME_DOTENV":  "Cake",
+		"title":        "TOML Example",
+		"newkey":       "remote",
 		"batters": map[string]interface{}{
 			"batter": []interface{}{
 				map[string]interface{}{
@@ -859,6 +1041,7 @@ func TestDirsSearch(t *testing.T) {
 	v.SetDefault(`key`, `default`)
 
 	entries, err := ioutil.ReadDir(root)
+	assert.Nil(t, err)
 	for _, e := range entries {
 		if e.IsDir() {
 			v.AddConfigPath(e.Name())
@@ -868,7 +1051,7 @@ func TestDirsSearch(t *testing.T) {
 	err = v.ReadInConfig()
 	assert.Nil(t, err)
 
-	assert.Equal(t, `value is `+path.Base(v.configPaths[0]), v.GetString(`key`))
+	assert.Equal(t, `value is `+filepath.Base(v.configPaths[0]), v.GetString(`key`))
 }
 
 func TestWrongDirsSearchNotFound(t *testing.T) {
@@ -1077,6 +1260,43 @@ func TestWriteConfigTOML(t *testing.T) {
 	assert.Equal(t, v.GetString("owner.organization"), v2.GetString("owner.organization"))
 }
 
+var dotenvWriteExpected = []byte(`
+TITLE="DotEnv Write Example"
+NAME=Oreo
+KIND=Biscuit
+`)
+
+func TestWriteConfigDotEnv(t *testing.T) {
+	fs := afero.NewMemMapFs()
+	v := New()
+	v.SetFs(fs)
+	v.SetConfigName("c")
+	v.SetConfigType("env")
+	err := v.ReadConfig(bytes.NewBuffer(dotenvWriteExpected))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.WriteConfigAs("c.env"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The TOML String method does not order the contents.
+	// Therefore, we must read the generated file and compare the data.
+	v2 := New()
+	v2.SetFs(fs)
+	v2.SetConfigName("c")
+	v2.SetConfigType("env")
+	v2.SetConfigFile("c.env")
+	err = v2.ReadInConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, v.GetString("title"), v2.GetString("title"))
+	assert.Equal(t, v.GetString("type"), v2.GetString("type"))
+	assert.Equal(t, v.GetString("kind"), v2.GetString("kind"))
+}
+
 var yamlWriteExpected = []byte(`age: 35
 beard: true
 clothing:
@@ -1116,7 +1336,8 @@ func TestWriteConfigYAML(t *testing.T) {
 var yamlMergeExampleTgt = []byte(`
 hello:
     pop: 37890
-    lagrenum: 765432101234567
+    largenum: 765432101234567
+    num2pow63: 9223372036854775808
     world:
     - us
     - uk
@@ -1127,10 +1348,13 @@ hello:
 var yamlMergeExampleSrc = []byte(`
 hello:
     pop: 45000
-    lagrenum: 7654321001234567
+    largenum: 7654321001234567
     universe:
     - mw
     - ad
+    ints:
+    - 1
+    - 2
 fu: bar
 `)
 
@@ -1149,8 +1373,20 @@ func TestMergeConfig(t *testing.T) {
 		t.Fatalf("pop != 37890, = %d", pop)
 	}
 
-	if pop := v.GetInt64("hello.lagrenum"); pop != int64(765432101234567) {
-		t.Fatalf("int64 lagrenum != 765432101234567, = %d", pop)
+	if pop := v.GetInt64("hello.largenum"); pop != int64(765432101234567) {
+		t.Fatalf("int64 largenum != 765432101234567, = %d", pop)
+	}
+
+	if pop := v.GetUint("hello.pop"); pop != 37890 {
+		t.Fatalf("uint pop != 37890, = %d", pop)
+	}
+
+	if pop := v.GetUint32("hello.pop"); pop != 37890 {
+		t.Fatalf("uint32 pop != 37890, = %d", pop)
+	}
+
+	if pop := v.GetUint64("hello.num2pow63"); pop != 9223372036854775808 {
+		t.Fatalf("uint64 num2pow63 != 9223372036854775808, = %d", pop)
 	}
 
 	if world := v.GetStringSlice("hello.world"); len(world) != 4 {
@@ -1173,8 +1409,8 @@ func TestMergeConfig(t *testing.T) {
 		t.Fatalf("pop != 45000, = %d", pop)
 	}
 
-	if pop := v.GetInt64("hello.lagrenum"); pop != int64(7654321001234567) {
-		t.Fatalf("int64 lagrenum != 7654321001234567, = %d", pop)
+	if pop := v.GetInt64("hello.largenum"); pop != int64(7654321001234567) {
+		t.Fatalf("int64 largenum != 7654321001234567, = %d", pop)
 	}
 
 	if world := v.GetStringSlice("hello.world"); len(world) != 4 {
@@ -1183,6 +1419,10 @@ func TestMergeConfig(t *testing.T) {
 
 	if universe := v.GetStringSlice("hello.universe"); len(universe) != 2 {
 		t.Fatalf("len(universe) != 2, = %d", len(universe))
+	}
+
+	if ints := v.GetIntSlice("hello.ints"); len(ints) != 2 {
+		t.Fatalf("len(ints) != 2, = %d", len(ints))
 	}
 
 	if fu := v.GetString("fu"); fu != "bar" {
@@ -1225,6 +1465,10 @@ func TestMergeConfigNoMerge(t *testing.T) {
 		t.Fatalf("len(universe) != 2, = %d", len(universe))
 	}
 
+	if ints := v.GetIntSlice("hello.ints"); len(ints) != 2 {
+		t.Fatalf("len(ints) != 2, = %d", len(ints))
+	}
+
 	if fu := v.GetString("fu"); fu != "bar" {
 		t.Fatalf("fu != \"bar\", = %s", fu)
 	}
@@ -1238,7 +1482,7 @@ func TestMergeConfigMap(t *testing.T) {
 	}
 
 	assert := func(i int) {
-		large := v.GetInt("hello.lagrenum")
+		large := v.GetInt64("hello.largenum")
 		pop := v.GetInt("hello.pop")
 		if large != 765432101234567 {
 			t.Fatal("Got large num:", large)
@@ -1596,6 +1840,23 @@ func TestWatchFile(t *testing.T) {
 
 }
 
+func TestUnmarshal_DotSeparatorBackwardCompatibility(t *testing.T) {
+	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	flags.String("foo.bar", "cobra_flag", "")
+
+	v := New()
+	assert.NoError(t, v.BindPFlags(flags))
+
+	config := &struct {
+		Foo struct {
+			Bar string
+		}
+	}{}
+
+	assert.NoError(t, v.Unmarshal(config))
+	assert.Equal(t, "cobra_flag", config.Foo.Bar)
+}
+
 func BenchmarkGetBool(b *testing.B) {
 	key := "BenchmarkGetBool"
 	v = New()
@@ -1620,7 +1881,7 @@ func BenchmarkGet(b *testing.B) {
 	}
 }
 
-// This is the "perfect result" for the above.
+// BenchmarkGetBoolFromMap is the "perfect result" for the above.
 func BenchmarkGetBoolFromMap(b *testing.B) {
 	m := make(map[string]bool)
 	key := "BenchmarkGetBool"

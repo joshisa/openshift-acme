@@ -40,6 +40,10 @@ func TestInstallHandler(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected %v, got %v", http.StatusOK, w.Code)
 	}
+	c := w.Header().Get("Content-Type")
+	if c != "text/plain; charset=utf-8" {
+		t.Errorf("expected %v, got %v", "text/plain", c)
+	}
 	if w.Body.String() != "ok" {
 		t.Errorf("expected %v, got %v", "ok", w.Body.String())
 	}
@@ -58,6 +62,10 @@ func TestInstallPathHandler(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected %v, got %v", http.StatusOK, w.Code)
 	}
+	c := w.Header().Get("Content-Type")
+	if c != "text/plain; charset=utf-8" {
+		t.Errorf("expected %v, got %v", "text/plain", c)
+	}
 	if w.Body.String() != "ok" {
 		t.Errorf("expected %v, got %v", "ok", w.Body.String())
 	}
@@ -70,6 +78,10 @@ func TestInstallPathHandler(t *testing.T) {
 	mux.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("expected %v, got %v", http.StatusOK, w.Code)
+	}
+	c = w.Header().Get("Content-Type")
+	if c != "text/plain; charset=utf-8" {
+		t.Errorf("expected %v, got %v", "text/plain", c)
 	}
 	if w.Body.String() != "ok" {
 		t.Errorf("expected %v, got %v", "ok", w.Body.String())
@@ -99,7 +111,7 @@ func testMultipleChecks(path string, t *testing.T) {
 
 	for i, test := range tests {
 		mux := http.NewServeMux()
-		checks := []HealthzChecker{PingHealthz}
+		checks := []HealthChecker{PingHealthz}
 		if test.addBadCheck {
 			checks = append(checks, NamedCheck("bad", func(_ *http.Request) error {
 				return errors.New("this will fail")
@@ -119,6 +131,10 @@ func testMultipleChecks(path string, t *testing.T) {
 		mux.ServeHTTP(w, req)
 		if w.Code != test.expectedStatus {
 			t.Errorf("case[%d] Expected: %v, got: %v", i, test.expectedStatus, w.Code)
+		}
+		c := w.Header().Get("Content-Type")
+		if c != "text/plain; charset=utf-8" {
+			t.Errorf("case[%d] Expected: %v, got: %v", i, "text/plain", c)
 		}
 		if w.Body.String() != test.expectedResponse {
 			t.Errorf("case[%d] Expected:\n%v\ngot:\n%v\n", i, test.expectedResponse, w.Body.String())
@@ -142,14 +158,14 @@ func TestCheckerNames(t *testing.T) {
 
 	testCases := []struct {
 		desc string
-		have []HealthzChecker
+		have []HealthChecker
 		want []string
 	}{
-		{"no checker", []HealthzChecker{}, []string{}},
-		{"one checker", []HealthzChecker{c1}, []string{n1}},
-		{"other checker", []HealthzChecker{c2}, []string{n2}},
-		{"checker order", []HealthzChecker{c1, c2}, []string{n1, n2}},
-		{"different checker order", []HealthzChecker{c2, c1}, []string{n2, n1}},
+		{"no checker", []HealthChecker{}, []string{}},
+		{"one checker", []HealthChecker{c1}, []string{n1}},
+		{"other checker", []HealthChecker{c2}, []string{n2}},
+		{"checker order", []HealthChecker{c1, c2}, []string{n1, n2}},
+		{"different checker order", []HealthChecker{c2, c1}, []string{n2, n1}},
 	}
 
 	for _, tc := range testCases {

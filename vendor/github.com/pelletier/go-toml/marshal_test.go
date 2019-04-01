@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,10 +13,10 @@ import (
 )
 
 type basicMarshalTestStruct struct {
-	String     string                      `toml:"string"`
-	StringList []string                    `toml:"strlist"`
-	Sub        basicMarshalTestSubStruct   `toml:"subdoc"`
-	SubList    []basicMarshalTestSubStruct `toml:"sublist"`
+	String     string                      `toml:"Zstring"`
+	StringList []string                    `toml:"Ystrlist"`
+	Sub        basicMarshalTestSubStruct   `toml:"Xsubdoc"`
+	SubList    []basicMarshalTestSubStruct `toml:"Wsublist"`
 }
 
 type basicMarshalTestSubStruct struct {
@@ -29,17 +30,131 @@ var basicTestData = basicMarshalTestStruct{
 	SubList:    []basicMarshalTestSubStruct{{"Two"}, {"Three"}},
 }
 
-var basicTestToml = []byte(`string = "Hello"
-strlist = ["Howdy","Hey There"]
+var basicTestToml = []byte(`Ystrlist = ["Howdy","Hey There"]
+Zstring = "Hello"
 
-[subdoc]
-  String2 = "One"
-
-[[sublist]]
+[[Wsublist]]
   String2 = "Two"
 
-[[sublist]]
+[[Wsublist]]
   String2 = "Three"
+
+[Xsubdoc]
+  String2 = "One"
+`)
+
+var basicTestTomlOrdered = []byte(`Zstring = "Hello"
+Ystrlist = ["Howdy","Hey There"]
+
+[Xsubdoc]
+  String2 = "One"
+
+[[Wsublist]]
+  String2 = "Two"
+
+[[Wsublist]]
+  String2 = "Three"
+`)
+
+var marshalTestToml = []byte(`title = "TOML Marshal Testing"
+
+[basic]
+  bool = true
+  date = 1979-05-27T07:32:00Z
+  float = 123.4
+  float64 = 123.456782132399
+  int = 5000
+  string = "Bite me"
+  uint = 5001
+
+[basic_lists]
+  bools = [true,false,true]
+  dates = [1979-05-27T07:32:00Z,1980-05-27T07:32:00Z]
+  floats = [12.3,45.6,78.9]
+  ints = [8001,8001,8002]
+  strings = ["One","Two","Three"]
+  uints = [5002,5003]
+
+[basic_map]
+  one = "one"
+  two = "two"
+
+[subdoc]
+
+  [subdoc.first]
+    name = "First"
+
+  [subdoc.second]
+    name = "Second"
+
+[[subdoclist]]
+  name = "List.First"
+
+[[subdoclist]]
+  name = "List.Second"
+
+[[subdocptrs]]
+  name = "Second"
+`)
+
+var marshalOrderPreserveToml = []byte(`title = "TOML Marshal Testing"
+
+[basic_lists]
+  floats = [12.3,45.6,78.9]
+  bools = [true,false,true]
+  dates = [1979-05-27T07:32:00Z,1980-05-27T07:32:00Z]
+  ints = [8001,8001,8002]
+  uints = [5002,5003]
+  strings = ["One","Two","Three"]
+
+[[subdocptrs]]
+  name = "Second"
+
+[basic_map]
+  one = "one"
+  two = "two"
+
+[subdoc]
+
+  [subdoc.second]
+    name = "Second"
+
+  [subdoc.first]
+    name = "First"
+
+[basic]
+  uint = 5001
+  bool = true
+  float = 123.4
+  float64 = 123.456782132399
+  int = 5000
+  string = "Bite me"
+  date = 1979-05-27T07:32:00Z
+
+[[subdoclist]]
+  name = "List.First"
+
+[[subdoclist]]
+  name = "List.Second"
+`)
+
+var mashalOrderPreserveMapToml = []byte(`title = "TOML Marshal Testing"
+
+[basic_map]
+  one = "one"
+  two = "two"
+
+[long_map]
+  a7 = "1"
+  b3 = "2"
+  c8 = "3"
+  d4 = "4"
+  e6 = "5"
+  f5 = "6"
+  g10 = "7"
+  h1 = "8"
+  i2 = "9"
+  j9 = "10"
 `)
 
 func TestBasicMarshal(t *testing.T) {
@@ -53,6 +168,18 @@ func TestBasicMarshal(t *testing.T) {
 	}
 }
 
+func TestBasicMarshalOrdered(t *testing.T) {
+	var result bytes.Buffer
+	err := NewEncoder(&result).Order(OrderPreserve).Encode(basicTestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := basicTestTomlOrdered
+	if !bytes.Equal(result.Bytes(), expected) {
+		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", expected, result.Bytes())
+	}
+}
+
 func TestBasicMarshalWithPointer(t *testing.T) {
 	result, err := Marshal(&basicTestData)
 	if err != nil {
@@ -61,6 +188,18 @@ func TestBasicMarshalWithPointer(t *testing.T) {
 	expected := basicTestToml
 	if !bytes.Equal(result, expected) {
 		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", expected, result)
+	}
+}
+
+func TestBasicMarshalOrderedWithPointer(t *testing.T) {
+	var result bytes.Buffer
+	err := NewEncoder(&result).Order(OrderPreserve).Encode(&basicTestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := basicTestTomlOrdered
+	if !bytes.Equal(result.Bytes(), expected) {
+		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", expected, result.Bytes())
 	}
 }
 
@@ -78,39 +217,46 @@ func TestBasicUnmarshal(t *testing.T) {
 
 type testDoc struct {
 	Title       string            `toml:"title"`
-	Basics      testDocBasics     `toml:"basic"`
 	BasicLists  testDocBasicLists `toml:"basic_lists"`
+	SubDocPtrs  []*testSubDoc     `toml:"subdocptrs"`
 	BasicMap    map[string]string `toml:"basic_map"`
 	Subdocs     testDocSubs       `toml:"subdoc"`
+	Basics      testDocBasics     `toml:"basic"`
 	SubDocList  []testSubDoc      `toml:"subdoclist"`
-	SubDocPtrs  []*testSubDoc     `toml:"subdocptrs"`
 	err         int               `toml:"shouldntBeHere"`
 	unexported  int               `toml:"shouldntBeHere"`
 	Unexported2 int               `toml:"-"`
 }
 
+type testMapDoc struct {
+	Title    string            `toml:"title"`
+	BasicMap map[string]string `toml:"basic_map"`
+	LongMap  map[string]string `toml:"long_map"`
+}
+
 type testDocBasics struct {
-	Bool       bool      `toml:"bool"`
-	Date       time.Time `toml:"date"`
-	Float      float32   `toml:"float"`
-	Int        int       `toml:"int"`
 	Uint       uint      `toml:"uint"`
+	Bool       bool      `toml:"bool"`
+	Float32    float32   `toml:"float"`
+	Float64    float64   `toml:"float64"`
+	Int        int       `toml:"int"`
 	String     *string   `toml:"string"`
+	Date       time.Time `toml:"date"`
 	unexported int       `toml:"shouldntBeHere"`
 }
 
 type testDocBasicLists struct {
+	Floats  []*float32  `toml:"floats"`
 	Bools   []bool      `toml:"bools"`
 	Dates   []time.Time `toml:"dates"`
-	Floats  []*float32  `toml:"floats"`
 	Ints    []int       `toml:"ints"`
-	Strings []string    `toml:"strings"`
 	UInts   []uint      `toml:"uints"`
+	Strings []string    `toml:"strings"`
 }
 
 type testDocSubs struct {
-	First  testSubDoc  `toml:"first"`
 	Second *testSubDoc `toml:"second"`
+	First  testSubDoc  `toml:"first"`
 }
 
 type testSubDoc struct {
@@ -131,7 +277,8 @@ var docData = testDoc{
 	Basics: testDocBasics{
 		Bool:       true,
 		Date:       time.Date(1979, 5, 27, 7, 32, 0, 0, time.UTC),
-		Float:      123.4,
+		Float32:    123.4,
+		Float64:    123.456782132399,
 		Int:        5000,
 		Uint:       5001,
 		String:     &biteMe,
@@ -163,14 +310,65 @@ var docData = testDoc{
 	SubDocPtrs: []*testSubDoc{&subdoc},
 }
 
+var mapTestDoc = testMapDoc{
+	Title: "TOML Marshal Testing",
+	BasicMap: map[string]string{
+		"one": "one",
+		"two": "two",
+	},
+	LongMap: map[string]string{
+		"h1":  "8",
+		"i2":  "9",
+		"b3":  "2",
+		"d4":  "4",
+		"f5":  "6",
+		"e6":  "5",
+		"a7":  "1",
+		"c8":  "3",
+		"j9":  "10",
+		"g10": "7",
+	},
+}
+
 func TestDocMarshal(t *testing.T) {
 	result, err := Marshal(docData)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected, _ := ioutil.ReadFile("marshal_test.toml")
-	if !bytes.Equal(result, expected) {
-		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", expected, result)
+	if !bytes.Equal(result, marshalTestToml) {
+		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", marshalTestToml, result)
+	}
+}
+
+func TestDocMarshalOrdered(t *testing.T) {
+	var result bytes.Buffer
+	err := NewEncoder(&result).Order(OrderPreserve).Encode(docData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(result.Bytes(), marshalOrderPreserveToml) {
+		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", marshalOrderPreserveToml, result.Bytes())
+	}
+}
+
+func TestDocMarshalMaps(t *testing.T) {
+	result, err := Marshal(mapTestDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(result, mashalOrderPreserveMapToml) {
+		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", mashalOrderPreserveMapToml, result)
+	}
+}
+
+func TestDocMarshalOrderedMaps(t *testing.T) {
+	var result bytes.Buffer
+	err := NewEncoder(&result).Order(OrderPreserve).Encode(mapTestDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(result.Bytes(), mashalOrderPreserveMapToml) {
+		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", mashalOrderPreserveMapToml, result.Bytes())
 	}
 }
 
@@ -179,16 +377,15 @@ func TestDocMarshalPointer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected, _ := ioutil.ReadFile("marshal_test.toml")
-	if !bytes.Equal(result, expected) {
-		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", expected, result)
+
+	if !bytes.Equal(result, marshalTestToml) {
+		t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", marshalTestToml, result)
 	}
 }
 
 func TestDocUnmarshal(t *testing.T) {
 	result := testDoc{}
-	tomlData, _ := ioutil.ReadFile("marshal_test.toml")
-	err := Unmarshal(tomlData, &result)
+	err := Unmarshal(marshalTestToml, &result)
 	expected := docData
 	if err != nil {
 		t.Fatal(err)
@@ -201,11 +398,22 @@ func TestDocUnmarshal(t *testing.T) {
 }
 
 func TestDocPartialUnmarshal(t *testing.T) {
-	result := testDocSubs{}
+	file, err := ioutil.TempFile("", "test-*.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file.Name())
 
-	tree, _ := LoadFile("marshal_test.toml")
+	err = ioutil.WriteFile(file.Name(), marshalTestToml, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tree, _ := LoadFile(file.Name())
 	subTree := tree.Get("subdoc").(*Tree)
-	err := subTree.Unmarshal(&result)
+
+	result := testDocSubs{}
+	err = subTree.Unmarshal(&result)
 	expected := docData.Subdocs
 	if err != nil {
 		t.Fatal(err)
@@ -1005,12 +1213,68 @@ func TestUnmarshalCustomTag(t *testing.T) {
 }
 
 func TestUnmarshalMap(t *testing.T) {
-	m := make(map[string]int)
-	m["a"] = 1
+	testToml := []byte(`
+		a = 1
+		b = 2
+		c = 3
+		`)
+	var result map[string]int
+	err := Unmarshal(testToml, &result)
+	if err != nil {
+		t.Errorf("Received unexpected error: %s", err)
+		return
+	}
 
-	err := Unmarshal(basicTestToml, m)
-	if err.Error() != "Only a pointer to struct can be unmarshaled from TOML" {
-		t.Fail()
+	expected := map[string]int{
+		"a": 1,
+		"b": 2,
+		"c": 3,
+	}
+
+	if !reflect.DeepEqual(result, expected) {
+		t.Errorf("Bad unmarshal: expected %v, got %v", expected, result)
+	}
+}
+
+func TestUnmarshalMapWithTypedKey(t *testing.T) {
+	testToml := []byte(`
+		a = 1
+		b = 2
+		c = 3
+		`)
+
+	type letter string
+	var result map[letter]int
+	err := Unmarshal(testToml, &result)
+	if err != nil {
+		t.Errorf("Received unexpected error: %s", err)
+		return
+	}
+
+	expected := map[letter]int{
+		"a": 1,
+		"b": 2,
+		"c": 3,
+	}
+
+	if !reflect.DeepEqual(result, expected) {
+		t.Errorf("Bad unmarshal: expected %v, got %v", expected, result)
+	}
+}
+
+func TestUnmarshalNonPointer(t *testing.T) {
+	a := 1
+	err := Unmarshal([]byte{}, a)
+	if err == nil {
+		t.Fatal("unmarshal should err when given a non pointer")
+	}
+}
+
+func TestUnmarshalInvalidPointerKind(t *testing.T) {
+	a := 1
+	err := Unmarshal([]byte{}, &a)
+	if err == nil {
+		t.Fatal("unmarshal should err when given an invalid pointer type")
 	}
 }
 
@@ -1261,5 +1525,177 @@ func TestUnmarshalDefaultFailureUnsupported(t *testing.T) {
 	err := Unmarshal([]byte(``), &doc)
 	if err == nil {
 		t.Fatal("should error")
+	}
+}
+
+func TestUnmarshalNestedAnonymousStructs(t *testing.T) {
+	type Nested struct {
+		Value string `toml:"nested_field"`
+	}
+	type Deep struct {
+		Nested
+	}
+	type Document struct {
+		Deep
+		Value string `toml:"own_field"`
+	}
+
+	var doc Document
+
+	err := Unmarshal([]byte(`nested_field = "nested value"`+"\n"+`own_field = "own value"`), &doc)
+	if err != nil {
+		t.Fatal("should not error")
+	}
+	if doc.Value != "own value" || doc.Nested.Value != "nested value" {
+		t.Fatal("unexpected values")
+	}
+}
+
+func TestUnmarshalNestedAnonymousStructs_Controversial(t *testing.T) {
+	type Nested struct {
+		Value string `toml:"nested"`
+	}
+	type Deep struct {
+		Nested
+	}
+	type Document struct {
+		Deep
+		Value string `toml:"own"`
+	}
+
+	var doc Document
+
+	err := Unmarshal([]byte(`nested = "nested value"`+"\n"+`own = "own value"`), &doc)
+	if err == nil {
+		t.Fatal("should error")
+	}
+}
+
+type unexportedFieldPreservationTest struct {
+	Exported   string `toml:"exported"`
+	unexported string
+	Nested1    unexportedFieldPreservationTestNested    `toml:"nested1"`
+	Nested2    *unexportedFieldPreservationTestNested   `toml:"nested2"`
+	Nested3    *unexportedFieldPreservationTestNested   `toml:"nested3"`
+	Slice1     []unexportedFieldPreservationTestNested  `toml:"slice1"`
+	Slice2     []*unexportedFieldPreservationTestNested `toml:"slice2"`
+}
+
+type unexportedFieldPreservationTestNested struct {
+	Exported1   string `toml:"exported1"`
+	unexported1 string
+}
+
+func TestUnmarshalPreservesUnexportedFields(t *testing.T) {
+	toml := `
+	exported = "visible"
+	unexported = "ignored"
+
+	[nested1]
+	exported1 = "visible1"
+	unexported1 = "ignored1"
+
+	[nested2]
+	exported1 = "visible2"
+	unexported1 = "ignored2"
+
+	[nested3]
+	exported1 = "visible3"
+	unexported1 = "ignored3"
+
+	[[slice1]]
+	exported1 = "visible3"
+	
+	[[slice1]]
+	exported1 = "visible4"
+
+	[[slice2]]
+	exported1 = "visible5"
+	`
+
+	t.Run("unexported field should not be set from toml", func(t *testing.T) {
+		var actual unexportedFieldPreservationTest
+		err := Unmarshal([]byte(toml), &actual)
+
+		if err != nil {
+			t.Fatal("did not expect an error")
+		}
+
+		expect := unexportedFieldPreservationTest{
+			Exported:   "visible",
+			unexported: "",
+			Nested1:    unexportedFieldPreservationTestNested{"visible1", ""},
+			Nested2:    &unexportedFieldPreservationTestNested{"visible2", ""},
+			Nested3:    &unexportedFieldPreservationTestNested{"visible3", ""},
+			Slice1: []unexportedFieldPreservationTestNested{
+				{Exported1: "visible3"},
+				{Exported1: "visible4"},
+			},
+			Slice2: []*unexportedFieldPreservationTestNested{
+				{Exported1: "visible5"},
+			},
+		}
+
+		if !reflect.DeepEqual(actual, expect) {
+			t.Fatalf("%+v did not equal %+v", actual, expect)
+		}
+	})
+
+	t.Run("unexported field should be preserved", func(t *testing.T) {
+		actual := unexportedFieldPreservationTest{
+			Exported:   "foo",
+			unexported: "bar",
+			Nested1:    unexportedFieldPreservationTestNested{"baz", "bax"},
+			Nested2:    nil,
+			Nested3:    &unexportedFieldPreservationTestNested{"baz", "bax"},
+		}
+		err := Unmarshal([]byte(toml), &actual)
+
+		if err != nil {
+			t.Fatal("did not expect an error")
+		}
+
+		expect := unexportedFieldPreservationTest{
+			Exported:   "visible",
+			unexported: "bar",
+			Nested1:    unexportedFieldPreservationTestNested{"visible1", "bax"},
+			Nested2:    &unexportedFieldPreservationTestNested{"visible2", ""},
+			Nested3:    &unexportedFieldPreservationTestNested{"visible3", "bax"},
+			Slice1: []unexportedFieldPreservationTestNested{
+				{Exported1: "visible3"},
+				{Exported1: "visible4"},
+			},
+			Slice2: []*unexportedFieldPreservationTestNested{
+				{Exported1: "visible5"},
+			},
+		}
+
+		if !reflect.DeepEqual(actual, expect) {
+			t.Fatalf("%+v did not equal %+v", actual, expect)
+		}
+	})
+}
+
+func TestTreeMarshal(t *testing.T) {
+	cases := [][]byte{
+		basicTestToml,
+		marshalTestToml,
+		emptyTestToml,
+		pointerTestToml,
+	}
+	for _, expected := range cases {
+		t.Run("", func(t *testing.T) {
+			tree, err := LoadBytes(expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := tree.Marshal()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(result, expected) {
+				t.Errorf("Bad marshal: expected\n-----\n%s\n-----\ngot\n-----\n%s\n-----\n", expected, result)
+			}
+		})
 	}
 }
