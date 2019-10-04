@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/golang/glog"
 	routev1 "github.com/openshift/api/route/v1"
 	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
 	_ "github.com/openshift/client-go/route/clientset/versioned/scheme"
@@ -31,6 +30,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog"
 
 	"github.com/tnozicka/openshift-acme/pkg/acme/challengeexposers"
 	acmeclient "github.com/tnozicka/openshift-acme/pkg/acme/client"
@@ -109,7 +109,7 @@ func NewRouteController(
 ) *RouteController {
 
 	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(glog.Infof)
+	eventBroadcaster.StartLogging(klog.Infof)
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClientset.CoreV1().Events("")})
 
 	rc := &RouteController{
@@ -169,11 +169,11 @@ func (rc *RouteController) enqueueRoute(route *routev1.Route) {
 func (rc *RouteController) addRoute(obj interface{}) {
 	route := obj.(*routev1.Route)
 	if !util.IsManaged(route) {
-		glog.V(5).Infof("Skipping Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
+		klog.V(5).Infof("Skipping Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
 		return
 	}
 
-	glog.V(4).Infof("Adding Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
+	klog.V(4).Infof("Adding Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
 	rc.enqueueRoute(route)
 }
 
@@ -182,11 +182,11 @@ func (rc *RouteController) updateRoute(old, cur interface{}) {
 	newRoute := cur.(*routev1.Route)
 
 	if !util.IsManaged(newRoute) {
-		glog.V(5).Infof("Skipping Route %s/%s UID=%s RV=%s", newRoute.Namespace, newRoute.Name, newRoute.UID, newRoute.ResourceVersion)
+		klog.V(5).Infof("Skipping Route %s/%s UID=%s RV=%s", newRoute.Namespace, newRoute.Name, newRoute.UID, newRoute.ResourceVersion)
 		return
 	}
 
-	glog.V(4).Infof("Updating Route from %s/%s UID=%s RV=%s to %s/%s UID=%s,RV=%s",
+	klog.V(4).Infof("Updating Route from %s/%s UID=%s RV=%s to %s/%s UID=%s,RV=%s",
 		oldRoute.Namespace, oldRoute.Name, oldRoute.UID, oldRoute.ResourceVersion,
 		newRoute.Namespace, newRoute.Name, newRoute.UID, newRoute.ResourceVersion)
 
@@ -209,11 +209,11 @@ func (rc *RouteController) deleteRoute(obj interface{}) {
 	}
 
 	if !util.IsManaged(route) {
-		glog.V(5).Infof("Skipping Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
+		klog.V(5).Infof("Skipping Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
 		return
 	}
 
-	glog.V(4).Infof("Deleting Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
+	klog.V(4).Infof("Deleting Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
 	rc.enqueueRoute(route)
 }
 
@@ -234,7 +234,7 @@ func (rc *RouteController) updateSecret(old, cur interface{}) {
 		if route == nil {
 			return
 		}
-		glog.V(4).Infof("Acme Secret %s/%s updated.", curSecret.Namespace, curSecret.Name)
+		klog.V(4).Infof("Acme Secret %s/%s updated.", curSecret.Namespace, curSecret.Name)
 		rc.enqueueRoute(route)
 		return
 	}
@@ -264,7 +264,7 @@ func (rc *RouteController) deleteSecret(obj interface{}) {
 		return
 	}
 
-	glog.V(4).Infof("Secret %s/%s deleted.", secret.Namespace, secret.Name)
+	klog.V(4).Infof("Secret %s/%s deleted.", secret.Namespace, secret.Name)
 	rc.enqueueRoute(route)
 }
 
@@ -296,12 +296,12 @@ func (rc *RouteController) getState(t time.Time, route *routev1.Route, accountUr
 		if ok {
 			owner, ok := route.Annotations[api.AcmeAwaitingAuthzUrlOwnerAnnotation]
 			if !ok {
-				glog.Warningf("Missing Route with %q annotation is missing %q annotation!", api.AcmeAwaitingAuthzUrlAnnotation, api.AcmeAwaitingAuthzUrlOwnerAnnotation)
+				klog.Warningf("Missing Route with %q annotation is missing %q annotation!", api.AcmeAwaitingAuthzUrlAnnotation, api.AcmeAwaitingAuthzUrlOwnerAnnotation)
 				return api.AcmeStateNeedsCert
 			}
 
 			if owner != accountUrl {
-				glog.Warningf("%s mismatch: authorization owner is %q but current account is %q. This is likely because the acme-account was recreated in the meantime.", api.AcmeAwaitingAuthzUrlOwnerAnnotation, owner, accountUrl)
+				klog.Warningf("%s mismatch: authorization owner is %q but current account is %q. This is likely because the acme-account was recreated in the meantime.", api.AcmeAwaitingAuthzUrlOwnerAnnotation, owner, accountUrl)
 				return api.AcmeStateNeedsCert
 			}
 
@@ -319,13 +319,13 @@ func (rc *RouteController) getState(t time.Time, route *routev1.Route, accountUr
 	}
 	certificate, err := certPemData.Certificate()
 	if err != nil {
-		glog.Errorf("Failed to decode certificate from route %s/%s", route.Namespace, route.Name)
+		klog.Errorf("Failed to decode certificate from route %s/%s", route.Namespace, route.Name)
 		return api.AcmeStateNeedsCert
 	}
 
 	err = certificate.VerifyHostname(route.Spec.Host)
 	if err != nil {
-		glog.Errorf("Certificate is invalid for route %s/%s with hostname %q", route.Namespace, route.Name, route.Spec.Host)
+		klog.Errorf("Certificate is invalid for route %s/%s with hostname %q", route.Namespace, route.Name, route.Spec.Host)
 		return api.AcmeStateNeedsCert
 	}
 
@@ -339,7 +339,7 @@ func (rc *RouteController) getState(t time.Time, route *routev1.Route, accountUr
 
 	// This is the deadline when we start renewing
 	if remains <= lifetime/3 {
-		glog.Infof("Renewing cert because we reached a deadline of %s", remains)
+		klog.Infof("Renewing cert because we reached a deadline of %s", remains)
 		return api.AcmeStateNeedsCert
 	}
 
@@ -353,7 +353,7 @@ func (rc *RouteController) getState(t time.Time, route *routev1.Route, accountUr
 		n := r.NormFloat64()*RenewalStandardDeviation + RenewalMean
 		// We use left half of normal distribution (all negative numbers).
 		if n < 0 {
-			glog.V(4).Infof("Renewing cert in advance with %s remaining to spread the load.", remains)
+			klog.V(4).Infof("Renewing cert in advance with %s remaining to spread the load.", remains)
 			return api.AcmeStateNeedsCert
 		}
 	}
@@ -382,19 +382,19 @@ func (rc *RouteController) wrapExposers(exposers map[string]challengeexposers.In
 // TODO: extract common parts to be re-used by ingress controller
 func (rc *RouteController) handle(key string) error {
 	startTime := time.Now()
-	glog.V(4).Infof("Started syncing Route %q (%v)", key, startTime)
+	klog.V(4).Infof("Started syncing Route %q (%v)", key, startTime)
 	defer func() {
-		glog.V(4).Infof("Finished syncing Route %q (%v)", key, time.Since(startTime))
+		klog.V(4).Infof("Finished syncing Route %q (%v)", key, time.Since(startTime))
 	}()
 
 	objReadOnly, exists, err := rc.routeIndexer.GetByKey(key)
 	if err != nil {
-		glog.Errorf("Fetching object with key %s from store failed with %v", key, err)
+		klog.Errorf("Fetching object with key %s from store failed with %v", key, err)
 		return err
 	}
 
 	if !exists {
-		glog.V(4).Infof("Route %s does not exist anymore\n", key)
+		klog.V(4).Infof("Route %s does not exist anymore\n", key)
 		return nil
 	}
 
@@ -408,12 +408,12 @@ func (rc *RouteController) handle(key string) error {
 
 	// We have to check if Route is admitted to be sure it owns the domain!
 	if !routeutil.IsAdmitted(routeReadOnly) {
-		glog.V(4).Infof("Skipping Route %s because it's not admitted", key)
+		klog.V(4).Infof("Skipping Route %s because it's not admitted", key)
 		return nil
 	}
 
 	if routeReadOnly.Annotations[api.TlsAcmePausedAnnotation] == "true" {
-		glog.V(4).Infof("Skipping Route %s because it is paused", key)
+		klog.V(4).Infof("Skipping Route %s because it is paused", key)
 
 		// TODO: reconcile (e.g. related secrets)
 		return nil
@@ -437,10 +437,10 @@ func (rc *RouteController) handle(key string) error {
 		if err != nil {
 			return fmt.Errorf("failed to authorize domain %q: %v", routeReadOnly.Spec.Host, err)
 		}
-		glog.V(4).Infof("Created authorization %q for Route %s", authorization.URI, key)
+		klog.V(4).Infof("Created authorization %q for Route %s", authorization.URI, key)
 
 		if authorization.Status == acme.StatusValid {
-			glog.V(4).Infof("Authorization %q for Route %s is already valid", authorization.URI, key)
+			klog.V(4).Infof("Authorization %q for Route %s is already valid", authorization.URI, key)
 		}
 
 		route := routeReadOnly.DeepCopy()
@@ -452,11 +452,11 @@ func (rc *RouteController) handle(key string) error {
 		// TODO: convert to PATCH to avoid loosing time and rate limits on update collisions
 		_, err = rc.routeClientset.RouteV1().Routes(route.Namespace).Update(route)
 		if err != nil {
-			glog.Errorf("Failed to update Route %s: %v. Revoking authorization %q so it won't stay pending.", key, err, authorization.URI)
+			klog.Errorf("Failed to update Route %s: %v. Revoking authorization %q so it won't stay pending.", key, err, authorization.URI)
 			// We need to try to cancel the authorization so we don't leave pending authorization behind and get rate limited
 			acmeErr := client.Client.RevokeAuthorization(ctx, authorization.URI)
 			if acmeErr != nil {
-				glog.Errorf("Failed to revoke authorization %q: %v", authorization.URI, acmeErr)
+				klog.Errorf("Failed to revoke authorization %q: %v", authorization.URI, acmeErr)
 			}
 
 			return fmt.Errorf("failed to update authorizationURI: %v", err)
@@ -480,7 +480,7 @@ func (rc *RouteController) handle(key string) error {
 			return fmt.Errorf("failed to get ACME authorization: %v", err)
 		}
 
-		glog.V(4).Infof("Route %q: authorization state is %q", key, authorization.Status)
+		klog.V(4).Infof("Route %q: authorization state is %q", key, authorization.Status)
 
 		exposers := rc.wrapExposers(rc.exposers, routeReadOnly)
 
@@ -492,7 +492,7 @@ func (rc *RouteController) handle(key string) error {
 			}
 
 			if authorization.Status == acme.StatusPending {
-				glog.V(4).Infof("Re-queuing Route %q due to pending authorization", key)
+				klog.V(4).Infof("Re-queuing Route %q due to pending authorization", key)
 
 				// TODO: get this value from authorization when this is fixed
 				// https://github.com/golang/go/issues/22457
@@ -512,7 +512,7 @@ func (rc *RouteController) handle(key string) error {
 			fallthrough
 
 		case acme.StatusValid:
-			glog.V(4).Infof("Authorization %q for Route %s successfully validated", authorization.URI, key)
+			klog.V(4).Infof("Authorization %q for Route %s successfully validated", authorization.URI, key)
 			// provision cert
 			template := x509.CertificateRequest{
 				Subject: pkix.Name{
@@ -520,7 +520,7 @@ func (rc *RouteController) handle(key string) error {
 				},
 			}
 			template.DNSNames = append(template.DNSNames, routeReadOnly.Spec.Host)
-			glog.Infof("template: %#v", template)
+			klog.Infof("template: %#v", template)
 			privateKey, err := rsa.GenerateKey(cryptorand.Reader, 4096)
 			if err != nil {
 				return fmt.Errorf("failed to generate RSA key: %v", err)
@@ -530,7 +530,7 @@ func (rc *RouteController) handle(key string) error {
 			if err != nil {
 				return fmt.Errorf("failed to create certificate request: %v", err)
 			}
-			glog.Infof("csr: %#v", string(csr))
+			klog.Infof("csr: %#v", string(csr))
 
 			// TODO: protect with expectations
 			// TODO: aks to split CreateCert func in acme library to avoid embedded pooling
@@ -538,7 +538,7 @@ func (rc *RouteController) handle(key string) error {
 			if err != nil {
 				return fmt.Errorf("failed to create ACME certificate: %v", err)
 			}
-			glog.V(4).Infof("Route %q - created certificate available at %s", key, certUrl)
+			klog.V(4).Infof("Route %q - created certificate available at %s", key, certUrl)
 
 			certPemData, err := cert.NewCertificateFromDER(der, privateKey)
 			if err != nil {
@@ -587,7 +587,7 @@ func (rc *RouteController) handle(key string) error {
 			rc.recorder.Eventf(routeReadOnly, corev1.EventTypeWarning, "AcmeRevokedAuthorization", "Acme authorization has been revoked for domain %q", routeReadOnly.Spec.Host)
 
 		case "deactivated":
-			glog.V(4).Infof("Authorization %q is %s.", authorization.URI, authorization.Status)
+			klog.V(4).Infof("Authorization %q is %s.", authorization.URI, authorization.Status)
 
 		case acme.StatusProcessing:
 			fallthrough
@@ -715,7 +715,7 @@ func (rc *RouteController) handleErr(err error, key interface{}) {
 	}
 
 	if rc.queue.NumRequeues(key) < MaxRetries {
-		glog.Infof("Error syncing Route %v: %v", key, err)
+		klog.Infof("Error syncing Route %v: %v", key, err)
 
 		// Re-enqueue the key rate limited. Based on the rate limiter on the
 		// queue and the re-enqueue history, the key will be processed later again.
@@ -726,7 +726,7 @@ func (rc *RouteController) handleErr(err error, key interface{}) {
 	rc.queue.Forget(key)
 	// Report to an external entity that, even after several retries, we could not successfully process this key
 	runtime.HandleError(err)
-	glog.Infof("Dropping Route %q out of the queue: %v", key, err)
+	klog.Infof("Dropping Route %q out of the queue: %v", key, err)
 }
 
 func (rc *RouteController) processNextItem() bool {
@@ -758,7 +758,7 @@ func (rc *RouteController) Run(workers int, stopCh <-chan struct{}) {
 	// Let the workers stop when we are done
 	defer rc.queue.ShutDown()
 
-	glog.Info("Starting Route controller")
+	klog.Info("Starting Route controller")
 
 	// Wait for all involved caches to be synced, before processing items from the queue is started
 	if !cache.WaitForCacheSync(stopCh, rc.routeInformerSynced, rc.secretInformerSynced) {
@@ -766,7 +766,7 @@ func (rc *RouteController) Run(workers int, stopCh <-chan struct{}) {
 		return
 	}
 
-	glog.Info("Starting Route controller: informer caches synced")
+	klog.Info("Starting Route controller: informer caches synced")
 
 	for i := 0; i < workers; i++ {
 		go wait.Until(rc.runWorker, time.Second, stopCh)
@@ -774,5 +774,5 @@ func (rc *RouteController) Run(workers int, stopCh <-chan struct{}) {
 
 	<-stopCh
 
-	glog.Info("Stopping Route controller")
+	klog.Info("Stopping Route controller")
 }

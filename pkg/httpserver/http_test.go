@@ -1,4 +1,4 @@
-package challengeexposers
+package httpserver
 
 import (
 	"context"

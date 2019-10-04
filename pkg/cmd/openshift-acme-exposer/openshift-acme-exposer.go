@@ -1,66 +1,65 @@
 package openshift_acme
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"strings"
+	"sync"
 
-	"github.com/golang/glog"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
+	"k8s.io/apimachinery/pkg/util/errors"
+
+	"k8s.io/klog"
 
 	kvalidationutil "k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/tnozicka/openshift-acme/pkg/cmd/genericclioptions"
 	cmdutil "github.com/tnozicka/openshift-acme/pkg/cmd/util"
+	"github.com/tnozicka/openshift-acme/pkg/httpserver"
+	"github.com/tnozicka/openshift-acme/pkg/signals"
 )
 
-type ExposerOptions struct {
+type Options struct {
 	genericclioptions.IOStreams
-	Loglevel int32
 
-	Data     *string
-	Port     uint16
-	ListenIP string
+	ResponseFile string
+	Port         uint16
+	ListenIP     string
 }
 
-func NewExposerOptions(streams genericclioptions.IOStreams) *ExposerOptions {
-	return &ExposerOptions{
-		IOStreams: streams,
-		Loglevel:  2,
-		Data:      nil,
-		Port:      5000,
-		ListenIP:  "0.0.0.0",
+func NewExposerOptions(streams genericclioptions.IOStreams) *Options {
+	return &Options{
+		IOStreams:    streams,
+		ResponseFile: "",
+		Port:         5000,
+		ListenIP:     "0.0.0.0",
 	}
 }
 
 func NewOpenShiftAcmeExposerCommand(streams genericclioptions.IOStreams) *cobra.Command {
 	o := NewExposerOptions(streams)
 
-	v := viper.New()
-	v.SetEnvPrefix("openshift_acme_exposer")
-	v.AutomaticEnv()
-	replacer := strings.NewReplacer("-", "_")
-	v.SetEnvKeyReplacer(replacer)
-
 	// Parent command to which all subcommands are added.
 	rootCmd := &cobra.Command{
 		Use:   "openshift-acme-exposer",
 		Short: "openshift-acme-exposer is a simple http server for exposing ACME token for validation.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			defer glog.Flush()
+			defer klog.Flush()
 
-			err := o.Complete()
+			err := o.Validate()
 			if err != nil {
 				return err
 			}
 
-			err = o.Validate()
+			err = o.Complete()
 			if err != nil {
 				return err
 			}
 
-			err = o.Run(v, cmd, streams.ErrOut)
+			err = o.Run(cmd, streams.ErrOut)
 			if err != nil {
 				return err
 			}
@@ -68,15 +67,9 @@ func NewOpenShiftAcmeExposerCommand(streams genericclioptions.IOStreams) *cobra.
 			return nil
 		},
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			// We have to bind Viper here because there is only one instance to avoid collisions
-			err := v.BindPFlags(cmd.PersistentFlags())
+			err := cmdutil.ReadFlagsFromEnv("OPENSHIFT_ACME_EXPOSER_", cmd)
 			if err != nil {
-				return fmt.Errorf("failed to bind Viper: %v", err)
-			}
-
-			err = cmdutil.MirrorViperForGLog(cmd, v)
-			if err != nil {
-				return fmt.Errorf("failed to install glog: %v", err)
+				return err
 			}
 
 			return nil
@@ -85,99 +78,100 @@ func NewOpenShiftAcmeExposerCommand(streams genericclioptions.IOStreams) *cobra.
 		SilenceUsage:  true,
 	}
 
-	rootCmd.PersistentFlags().StringP("data", "d", *o.Data, "Data to expose for every request on this server.")
-	rootCmd.PersistentFlags().Uint16P("port", "", o.Port, "Port for http-01 server")
-	rootCmd.PersistentFlags().StringP("listen-ip", "", o.ListenIP, "Listen address for http-01 server")
+	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
-	err := cmdutil.InstallGLog(rootCmd, o.Loglevel)
-	if err != nil {
-		panic(fmt.Errorf("failed to install glog: %v", err))
-	}
+	rootCmd.PersistentFlags().StringVarP(&o.ResponseFile, "response-file", "f", o.ResponseFile, "File containing data to expose using format `URI Response`.")
+	rootCmd.PersistentFlags().Uint16VarP(&o.Port, "port", "p", o.Port, "Port for http-01 server")
+	rootCmd.PersistentFlags().StringVarP(&o.ListenIP, "listen-ip", "l", o.ListenIP, "Listen address for http-01 server")
+
+	cmdutil.InstallKlog(rootCmd)
 
 	return rootCmd
 }
 
-func (o *ExposerOptions) Complete() error {
-	return nil
-}
-
-func (o *ExposerOptions) Validate() error {
-	if o.Data == nil {
-		return fmt.Errorf("no data specified for the exposer")
+func (o *Options) Validate() error {
+	if o.ResponseFile == "" {
+		return fmt.Errorf("no response-file specified")
 	}
 
 	errs := kvalidationutil.IsValidPortNum(int(o.Port))
 	if len(errs) > 0 {
-		return fmt.Errorf("Port has invalid value: %s", strings.Join(errs, ", "))
+		return fmt.Errorf("invalid port %v: %s", o.Port, strings.Join(errs, ", "))
+	}
+
+	errs = kvalidationutil.IsValidIP(o.ListenIP)
+	if len(errs) > 0 {
+		return fmt.Errorf("invalid listen IP %q: %s", o.ListenIP, strings.Join(errs, ", "))
 	}
 
 	return nil
 }
 
-func (o *ExposerOptions) Run(v *viper.Viper, cmd *cobra.Command, out io.Writer) error {
-	glog.Infof("Running with loglevel == %d", o.Loglevel)
-
+func (o *Options) Complete() error {
 	return nil
+}
 
-	/*
-		stopCh := signals.StopChannel()
-		ctx, cancel := context.WithCancel(context.Background())
-		go func() {
-			<-stopCh
-			cancel()
-		}()
+func (o *Options) Run(cmd *cobra.Command, out io.Writer) error {
+	stopCh := signals.StopChannel()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-stopCh
+		cancel()
+	}()
 
-		exposerPort := v.GetInt(Flag_ExposerPort)
-		errs := kvalidationutil.IsValidPortNum(exposerPort)
-		if len(errs) > 0 {
-			return fmt.Errorf("flag %q has invalid value: %s", Flag_ExposerPort, strings.Join(errs, ", "))
-		}
+	klog.Infof("loglevel is set to %q", cmdutil.GetLoglevel())
 
-		exposerListenIP := v.GetString(Flag_ExposerListenIP)
-		if exposerListenIP == "" {
-			return fmt.Errorf("%q can't be empty string", Flag_ExposerListenIP)
-		} else {
-			errs := kvalidationutil.IsValidIP(exposerListenIP)
-			if len(errs) > 0 {
-				return fmt.Errorf("flag %q has invalid value: %s", Flag_ExposerListenIP, strings.Join(errs, ", "))
-			}
-		}
+	bytes, err := ioutil.ReadFile(o.ResponseFile)
+	if err != nil {
+		return err
+	}
 
-		data := v.GetString(Flag_Data_Key)
-		if data == "" {
-			glog.Warning("Exposing empty data.")
-		}
+	server := httpserver.Server{
+		ListenAddr:    fmt.Sprintf("%s:%d", o.ListenIP, o.Port),
+		UriToResponse: make(map[string]string),
+	}
 
-		handleAll := func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, data)
-			// o not log the content here as pod logs can be collected and the token is secret
-			glog.V(2).Infof("Responded for path %q", r.RequestURI)
-		}
+	err = server.ParseData(bytes)
+	if err != nil {
+		return err
+	}
 
-		mux := http.NewServeMux()
-		mux.HandleFunc("/", handleAll)
-		listenAddr := fmt.Sprintf("%s:%d", exposerListenIP, exposerPort)
-		server := &http.Server{
-			//Addr:    addr,
-			Handler: mux,
-		}
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
 
-		listener, err := net.Listen("tcp", listenAddr)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		err = server.Run()
 		if err != nil {
-			return err
+			errCh <- err
+			return
 		}
+	}()
 
-		glog.Infof("Listening on http://%s/", listener.Addr().String())
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 
-		go func() {
-			<-ctx.Done()
-			glog.Info("Stopping http server...")
-			ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			server.Shutdown(ctx)
-		}()
+		<-ctx.Done()
 
-		return server.Serve(listener)
-	*/
+		// Second SIGINT results in exit(1) so it can be forcefully terminated that way for now
+		err := server.Shutdown(context.TODO())
+		if err != nil {
+			errCh <- err
+			return
+		}
+		return
+	}()
+
+	wg.Wait()
+	close(errCh)
+
+	var errs []error
+	for err := range errCh {
+		errs = append(errs, err)
+	}
+
+	return errors.NewAggregate(errs)
 }

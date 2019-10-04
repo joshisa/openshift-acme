@@ -1,14 +1,26 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
 	"runtime"
 	"time"
 
+	"k8s.io/klog"
+
+	"github.com/tnozicka/openshift-acme/pkg/cmd/genericclioptions"
 	cmd "github.com/tnozicka/openshift-acme/pkg/cmd/openshift-acme-controller"
 )
+
+func init() {
+	klog.InitFlags(flag.CommandLine)
+	err := flag.Set("logtostderr", "true")
+	if err != nil {
+		panic(err)
+	}
+}
 
 func main() {
 	rand.Seed(time.Now().UTC().UnixNano())
@@ -17,10 +29,14 @@ func main() {
 		runtime.GOMAXPROCS(runtime.NumCPU())
 	}
 
-	command := cmd.NewOpenShiftAcmeCommand(os.Stdin, os.Stdout, os.Stderr)
+	command := cmd.NewOpenshiftAcmeControllerCommand(genericclioptions.IOStreams{
+		In:     os.Stdin,
+		Out:    os.Stdout,
+		ErrOut: os.Stderr,
+	})
 	err := command.Execute()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "Error: %s\n", err)
 		os.Exit(1)
 	}
 

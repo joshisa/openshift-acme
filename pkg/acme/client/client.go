@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/golang/glog"
 	"golang.org/x/crypto/acme"
+	"k8s.io/klog"
 
 	"github.com/tnozicka/openshift-acme/pkg/acme/challengeexposers"
 )
@@ -19,7 +19,7 @@ var once sync.Once
 
 func acceptTerms(tosURL string) bool {
 	once.Do(func() {
-		glog.Infof("By continuing running this program you agree to the CA's Terms of Service (%s). If you do not agree exit the program immediately!", tosURL)
+		klog.Infof("By continuing running this program you agree to the CA's Terms of Service (%s). If you do not agree exit the program immediately!", tosURL)
 	})
 
 	return true
@@ -55,7 +55,7 @@ func getStatisfiableCombinations(authorization *acme.Authorization, exposers map
 		satisfiable := true
 		for _, challengeId := range combination {
 			if challengeId >= len(authorization.Challenges) {
-				glog.Warningf("ACME authorization has contains challengeId %d out of range; %#v", challengeId, authorization)
+				klog.Warningf("ACME authorization has contains challengeId %d out of range; %#v", challengeId, authorization)
 				satisfiable = false
 				continue
 			}
@@ -80,14 +80,14 @@ func (c *Client) AcceptAuthorization(
 	domain string,
 	exposers map[string]challengeexposers.Interface,
 ) (*acme.Authorization, error) {
-	glog.V(4).Infof("Found %d possible combinations for authorization", len(authorization.Combinations))
+	klog.V(4).Infof("Found %d possible combinations for authorization", len(authorization.Combinations))
 
 	combinations := getStatisfiableCombinations(authorization, exposers)
 	if len(combinations) == 0 {
 		return nil, fmt.Errorf("none of %d combination could be satified", len(authorization.Combinations))
 	}
 
-	glog.V(4).Infof("Found %d valid combinations for authorization", len(combinations))
+	klog.V(4).Infof("Found %d valid combinations for authorization", len(combinations))
 
 	// TODO: sort combinations by preference
 

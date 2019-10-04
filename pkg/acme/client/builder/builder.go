@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/golang/glog"
 	acmelib "golang.org/x/crypto/acme"
 	corev1 "k8s.io/api/core/v1"
 	kapierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	kcorelistersv1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/klog"
 
 	acmeclient "github.com/tnozicka/openshift-acme/pkg/acme/client"
 )
@@ -133,7 +133,7 @@ func (f *SharedClientFactory) clientByRegisteringNewAccount(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	glog.Infof("Registered new ACME account %q", client.Account.URI)
+	klog.Infof("Registered new ACME account %q", client.Account.URI)
 
 	return client, nil
 }
@@ -159,7 +159,7 @@ func (f *SharedClientFactory) GetClient(ctx context.Context) (*acmeclient.Client
 
 		secret, err = f.kubeClientset.CoreV1().Secrets(f.secretNamespace).Create(secret)
 		if err == nil {
-			glog.Infof("Saved new ACME account %s/%s", secret.Namespace, secret.Name)
+			klog.Infof("Saved new ACME account %s/%s", secret.Namespace, secret.Name)
 			return client, nil
 		}
 

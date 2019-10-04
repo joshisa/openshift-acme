@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
 	routev1 "github.com/openshift/api/route/v1"
 	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
 	routeutil "github.com/tnozicka/openshift-acme/pkg/route"
@@ -26,6 +25,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	watchtools "k8s.io/client-go/tools/watch"
+	"k8s.io/klog"
 
 	"github.com/tnozicka/openshift-acme/pkg/acme/challengeexposers"
 	"github.com/tnozicka/openshift-acme/pkg/api"
@@ -106,12 +106,12 @@ func (e *Exposer) cleanupTmpObjects() error {
 	for _, route := range routes.Items {
 		controllerRef := metav1.GetControllerOf(&route)
 		if controllerRef == nil {
-			glog.V(2).Infof("Ignoring Route %s/%s with missing controllerRef.", route.Namespace, route.Name)
+			klog.V(2).Infof("Ignoring Route %s/%s with missing controllerRef.", route.Namespace, route.Name)
 			continue
 		}
 
 		if controllerRef.UID != e.route.UID {
-			glog.V(2).Infof("Ignoring Route %s/%s with unmatching controllerRef.", route.Namespace, route.Name)
+			klog.V(2).Infof("Ignoring Route %s/%s with unmatching controllerRef.", route.Namespace, route.Name)
 			continue
 		}
 
@@ -249,7 +249,7 @@ func (e *Exposer) Expose(c *acme.Client, domain string, token string) error {
 				Protocol: corev1.ProtocolTCP,
 			},
 		}
-		glog.V(4).Infof("Using unprivileged traffic redirection for exposing Service %s/%s", e.route.Namespace, serviceDef.Name)
+		klog.V(4).Infof("Using unprivileged traffic redirection for exposing Service %s/%s", e.route.Namespace, serviceDef.Name)
 	}
 
 	service, err := e.kubeClientset.CoreV1().Services(e.route.Namespace).Create(serviceDef)
@@ -293,7 +293,7 @@ func (e *Exposer) Expose(c *acme.Client, domain string, token string) error {
 		}
 	}
 
-	glog.V(4).Infof("Waiting for exposing route %s/%s to be admitted.", route.Namespace, route.Name)
+	klog.V(4).Infof("Waiting for exposing route %s/%s to be admitted.", route.Namespace, route.Name)
 
 	if !routeutil.IsAdmitted(route) {
 		// TODO: switch to informer to avoid broken watches
@@ -322,7 +322,7 @@ func (e *Exposer) Expose(c *acme.Client, domain string, token string) error {
 			return fmt.Errorf("exceeded timeout %v while waiting for Route %s/%s to be admitted: %v", RouterAdmitTimeout, route.Namespace, route.Name, err)
 		}
 	}
-	glog.V(4).Infof("Exposing route %s/%s has been admitted. Ingresses: %#v", route.Namespace, route.Name, route.Status.Ingress)
+	klog.V(4).Infof("Exposing route %s/%s has been admitted. Ingresses: %#v", route.Namespace, route.Name, route.Status.Ingress)
 
 	err = e.underlyingExposer.Expose(c, domain, token)
 	if err != nil {
@@ -330,7 +330,7 @@ func (e *Exposer) Expose(c *acme.Client, domain string, token string) error {
 	}
 
 	// We need to wait for Route to be accessible on the Router because because Route can be admitted but not exposed yet.
-	glog.V(4).Infof("Waiting for route %s/%s to be exposed on the router.", route.Namespace, route.Name)
+	klog.V(4).Infof("Waiting for route %s/%s to be exposed on the router.", route.Namespace, route.Name)
 
 	url := "http://" + domain + c.HTTP01ChallengePath(token)
 	key, err := c.HTTP01ChallengeResponse(token)
@@ -356,7 +356,7 @@ func (e *Exposer) Expose(c *acme.Client, domain string, token string) error {
 
 			response, err := client.Get(url)
 			if err != nil {
-				glog.Warningf("Failed to GET %q: %v", url, err)
+				klog.Warningf("Failed to GET %q: %v", url, err)
 				return false, nil
 			}
 
@@ -366,18 +366,18 @@ func (e *Exposer) Expose(c *acme.Client, domain string, token string) error {
 			buffer := make([]byte, 2048)
 			n, err := response.Body.Read(buffer)
 			if err != nil && err != io.EOF {
-				glog.Warningf("Failed to read response body into buffer: %v", err)
+				klog.Warningf("Failed to read response body into buffer: %v", err)
 				return false, nil
 			}
 			body := string(buffer[:n])
 
 			if response.StatusCode != http.StatusOK {
-				glog.V(3).Infof("Failed to GET %q: %s: %s", url, response.Status, util.FirstNLines(util.MaxNCharacters(body, 160), 5))
+				klog.V(3).Infof("Failed to GET %q: %s: %s", url, response.Status, util.FirstNLines(util.MaxNCharacters(body, 160), 5))
 				return false, nil
 			}
 
 			if body != key {
-				glog.V(3).Infof("Key for route %s/%s is not yet exposed.", route.Namespace, route.Name)
+				klog.V(3).Infof("Key for route %s/%s is not yet exposed.", route.Namespace, route.Name)
 				return false, nil
 			}
 
@@ -387,7 +387,7 @@ func (e *Exposer) Expose(c *acme.Client, domain string, token string) error {
 	if err != nil {
 		e.recorder.Event(e.route, "Controller failed to verify that exposing Route is accessible. It will continue with ACME validation but chances are that either exposing failed or your domain can't be reached from inside the cluster.", corev1.EventTypeWarning, "ExposingRouteNotVerified")
 	} else {
-		glog.V(4).Infof("Exposing Route %s/%s is accessible and contains correct response.", route.Namespace, route.Name)
+		klog.V(4).Infof("Exposing Route %s/%s is accessible and contains correct response.", route.Namespace, route.Name)
 	}
 
 	return nil
