@@ -4,39 +4,47 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"strings"
+	"time"
 
-	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
-	routeinformersv1 "github.com/openshift/client-go/route/informers/externalversions/route/v1"
 	"github.com/spf13/cobra"
-	kvalidation "k8s.io/apimachinery/pkg/api/validation"
-	"k8s.io/apimachinery/pkg/util/errors"
-	kcoreinformersv1 "k8s.io/client-go/informers/core/v1"
-	"k8s.io/client-go/kubernetes"
 
+	kvalidation "k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kcorelistersv1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/klog"
 
-	"github.com/tnozicka/openshift-acme/pkg/acme/challengeexposers"
+	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
+
 	acmeclientbuilder "github.com/tnozicka/openshift-acme/pkg/acme/client/builder"
 	"github.com/tnozicka/openshift-acme/pkg/cmd/genericclioptions"
 	cmdutil "github.com/tnozicka/openshift-acme/pkg/cmd/util"
 	routecontroller "github.com/tnozicka/openshift-acme/pkg/controllers/route"
+	kubeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/kube"
+	routeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/route"
 	"github.com/tnozicka/openshift-acme/pkg/signals"
 )
 
 type Options struct {
 	genericclioptions.IOStreams
 
-	Workers           int
-	Kubeconfig        string
-	Namespaces        []string
-	AcmeUrl           string
-	AcmeAccountSecret string
+	Workers                     int
+	Kubeconfig                  string
+	ControllerNamespace         string
+	LeaderelectionLeaseDuration time.Duration
+	LeaderelectionRenewDeadline time.Duration
+	LeaderelectionRetryPeriod   time.Duration
+	Namespaces                  []string
+	AcmeUrl                     string
+	AcmeAccountSecret           string
 
 	restConfig  *restclient.Config
 	kubeClient  kubernetes.Interface
@@ -45,9 +53,14 @@ type Options struct {
 
 func NewOptions(streams genericclioptions.IOStreams) *Options {
 	return &Options{
-		IOStreams:         streams,
-		Workers:           10,
-		Kubeconfig:        "",
+		IOStreams:  streams,
+		Workers:    10,
+		Kubeconfig: "",
+
+		LeaderelectionLeaseDuration: 15 * time.Second,
+		LeaderelectionRenewDeadline: 10 * time.Second,
+		LeaderelectionRetryPeriod:   2 * time.Second,
+
 		AcmeUrl:           "https://acme-staging.api.letsencrypt.org/directory",
 		AcmeAccountSecret: "acme-account",
 		Namespaces:        []string{metav1.NamespaceAll},
@@ -97,7 +110,13 @@ func NewOpenshiftAcmeControllerCommand(streams genericclioptions.IOStreams) *cob
 	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
 	rootCmd.PersistentFlags().StringVarP(&o.Kubeconfig, "kubeconfig", "", o.Kubeconfig, "Path to the kubeconfig file")
-	rootCmd.PersistentFlags().StringVarP(&o.AcmeUrl, "acmeurl", "", o.AcmeUrl, "ACME URL like https://acme-v01.api.letsencrypt.org/directory")
+	rootCmd.PersistentFlags().StringVarP(&o.ControllerNamespace, "controller-namespace", "", o.ControllerNamespace, "Namespace where the controller is running. Autodetected if run inside a cluster.")
+
+	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionLeaseDuration, "leaderelection-lease-duration", "LeaseDuration is the duration that non-leader candidates will wait to force acquire leadership.", o.LeaderelectionLeaseDuration, "")
+	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionRenewDeadline, "leaderelection-renew-deadline", "RenewDeadline is the duration that the acting master will retry refreshing leadership before giving up.", o.LeaderelectionRenewDeadline, "")
+	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionRetryPeriod, "leaderelection-retry-period", "RetryPeriod is the duration the LeaderElector clients should wait between tries of actions.", o.LeaderelectionRetryPeriod, "")
+
+	rootCmd.PersistentFlags().StringVarP(&o.AcmeUrl, "acmeurl", "", o.AcmeUrl, "ACME URL like https://acme-v02.api.letsencrypt.org/directory")
 	rootCmd.PersistentFlags().StringArrayVarP(&o.Namespaces, "namespace", "n", o.Namespaces, "Restricts controller to namespace(s). If not specified controller watches all namespaces.")
 	rootCmd.PersistentFlags().StringVarP(&o.AcmeAccountSecret, "acme-account-secret", "", o.AcmeAccountSecret, "Name of the Secret holding ACME account.")
 
@@ -150,6 +169,15 @@ func (o *Options) Complete() error {
 		}
 	}
 
+	if len(o.ControllerNamespace) == 0 {
+		// Autodetect if running inside a cluster
+		bytes, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+		if err != nil {
+			return fmt.Errorf("can't autodetect controller namespace: %v", err)
+		}
+		o.ControllerNamespace = string(bytes)
+	}
+
 	o.kubeClient, err = kubernetes.NewForConfig(o.restConfig)
 	if err != nil {
 		return fmt.Errorf("can't build kubernetes clientset: %v", err)
@@ -176,39 +204,70 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 		cancel()
 	}()
 
-	klog.Infof("loglevel is set to %q", cmdutil.GetLoglevel())
-	klog.Infof("Using ACME server URL %q", o.AcmeUrl)
-
-	for _, namespace := range o.Namespaces {
-		cache.NewIndexerInformer()
-	}
-
-	routeInformer := routeinformersv1.NewRouteInformer(routeClientset, namespace, ResyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
-	klog.Infof("Starting Route informer")
-	go routeInformer.Run(stopCh)
-
-	secretInformer := kcoreinformersv1.NewSecretInformer(kubeClientset, namespace, ResyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
-	klog.Infof("Starting Secret informer")
-	go secretInformer.Run(stopCh)
-
-	http01, err := challengeexposers.NewHttp01(ctx, listenAddr)
+	hostname, err := os.Hostname()
 	if err != nil {
 		return err
 	}
+	// add a uniquifier so that two processes on the same host don't accidentally both become active
+	id := hostname + "_" + string(uuid.NewUUID())
+	klog.V(4).Infof("Leaderelection ID is %q", id)
 
-	exposers := map[string]challengeexposers.Interface{
-		"http-01": http01,
+	// we use the Lease lock type since edits to Leases are less common
+	// and fewer objects in the cluster watch "all Leases".
+	lock := &resourcelock.ConfigMapLock{
+		ConfigMapMeta: metav1.ObjectMeta{
+			Name:      "acme-controller-locks",
+			Namespace: o.ControllerNamespace,
+		},
+		Client: o.kubeClient.CoreV1(),
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity: id,
+		},
 	}
 
-	// Wait secretInformer to sync so we can create acmeClientFactory
-	if !cache.WaitForCacheSync(stopCh, secretInformer.HasSynced) {
-		return fmt.Errorf("timed out waiting for secretInformer caches to sync")
-	}
-	secretLister := kcorelistersv1.NewSecretLister(secretInformer.GetIndexer())
-	acmeClientFactory := acmeclientbuilder.NewSharedClientFactory(acmeUrl, accountName, selfNamespace, kubeClientset, secretLister)
+	leChan := make(chan os.Signal, 2)
 
-	rc := routecontroller.NewRouteController(acmeClientFactory, exposers, routeClientset, kubeClientset, routeInformer, secretInformer, exposerIP, int32(exposerPort), selfNamespace, selfSelector, defaultRouteTermination)
-	go rc.Run(Workers, stopCh)
+	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+		Lock:          lock,
+		LeaseDuration: o.LeaderelectionLeaseDuration,
+		RenewDeadline: o.LeaderelectionRenewDeadline,
+		RetryPeriod:   o.LeaderelectionRetryPeriod,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(ctx context.Context) {
+
+			},
+			OnStoppedLeading: func() {
+				klog.Fatalf("leaderelection lost")
+			},
+		},
+		Name: "openshift-acme",
+	})
+	if err != nil {
+		return fmt.Errorf("leaderelection failed: %v")
+	}
+	le.Run(ctx)
+
+	select {
+	case <-leChan:
+		klog.Infof("Acquired leaderelection")
+	case <-stopCh:
+		return fmt.Errorf("interrupted before leaderelection")
+	}
+
+	klog.Infof("loglevel is set to %q", cmdutil.GetLoglevel())
+	klog.Infof("Using ACME server URL %q", o.AcmeUrl)
+
+	kubeInformersForNamespaces := kubeinformers.NewKubeInformersForNamespaces(o.kubeClient, o.Namespaces)
+	routeInformersForNamespaces := routeinformers.NewRouteInformersForNamespaces(o.routeClient, o.Namespaces)
+
+	acmeClientFactory := acmeclientbuilder.NewSharedClientFactory(o.AcmeUrl, o.AcmeAccountSecret, o.ControllerNamespace, o.kubeClient, kubeInformersForNamespaces.InformersFor(o.ControllerNamespace).Core().V1().Secrets().Lister())
+
+	rc := routecontroller.NewRouteController(acmeClientFactory, o.kubeClient, kubeInformersForNamespaces, o.routeClient, routeInformersForNamespaces)
+
+	kubeInformersForNamespaces.Start(stopCh)
+	routeInformersForNamespaces.Start(stopCh)
+
+	go rc.Run(o.Workers, stopCh)
 
 	<-stopCh
 

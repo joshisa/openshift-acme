@@ -14,7 +14,6 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
 	_ "github.com/openshift/client-go/route/clientset/versioned/scheme"
-	routelistersv1 "github.com/openshift/client-go/route/listers/route/v1"
 	"golang.org/x/crypto/acme"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -26,7 +25,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	kcorelistersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
@@ -37,6 +35,8 @@ import (
 	acmeclientbuilder "github.com/tnozicka/openshift-acme/pkg/acme/client/builder"
 	"github.com/tnozicka/openshift-acme/pkg/api"
 	"github.com/tnozicka/openshift-acme/pkg/cert"
+	kubeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/kube"
+	routeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/route"
 	routeutil "github.com/tnozicka/openshift-acme/pkg/route"
 	"github.com/tnozicka/openshift-acme/pkg/util"
 )
@@ -60,98 +60,64 @@ var (
 type RouteController struct {
 	acmeClientFactory *acmeclientbuilder.SharedClientFactory
 
-	// TODO: switch this for generic interface to allow other types like DNS01
-	exposers map[string]challengeexposers.Interface
+	kubeClient                 kubernetes.Interface
+	kubeInformersForNamespaces kubeinformers.Interface
 
-	routeIndexer cache.Indexer
+	routeClient                 routeclientset.Interface
+	routeInformersForNamespaces routeinformers.Interface
 
-	routeClientset routeclientset.Interface
-	kubeClientset  kubernetes.Interface
-
-	routeInformer  cache.SharedIndexInformer
-	secretInformer cache.SharedIndexInformer
-
-	routeLister  routelistersv1.RouteLister
-	secretLister kcorelistersv1.SecretLister
-
-	// routeInformerSynced returns true if the Route store has been synced at least once.
-	// Added as a member to the struct to allow injection for testing.
-	routeInformerSynced cache.InformerSynced
-
-	// secretInformerSynced returns true if the Secret store has been synced at least once.
-	// Added as a member to the struct to allow injection for testing.
-	secretInformerSynced cache.InformerSynced
+	cachesToSync []cache.InformerSynced
 
 	recorder record.EventRecorder
 
 	queue workqueue.RateLimitingInterface
-
-	exposerIP     string
-	exposerPort   int32
-	selfNamespace string
-	selfSelector  map[string]string
-
-	defaultRouteTermination routev1.InsecureEdgeTerminationPolicyType
 }
 
 func NewRouteController(
 	acmeClientFactory *acmeclientbuilder.SharedClientFactory,
-	exposers map[string]challengeexposers.Interface,
-	routeClientset routeclientset.Interface,
-	kubeClientset kubernetes.Interface,
-	routeInformer cache.SharedIndexInformer,
-	secretInformer cache.SharedIndexInformer,
-	exposerIP string,
-	exposerPort int32,
-	selfNamespace string,
-	selfSelector map[string]string,
-	defaultRouteTermination routev1.InsecureEdgeTerminationPolicyType,
+	kubeClient kubernetes.Interface,
+	kubeInformersForNamespaces kubeinformers.Interface,
+	routeClient routeclientset.Interface,
+	routeInformersForNamespaces routeinformers.Interface,
 ) *RouteController {
-
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)
-	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClientset.CoreV1().Events("")})
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 
 	rc := &RouteController{
 		acmeClientFactory: acmeClientFactory,
 
-		exposers: exposers,
+		kubeClient:                 kubeClient,
+		kubeInformersForNamespaces: kubeInformersForNamespaces,
 
-		routeIndexer: routeInformer.GetIndexer(),
-
-		routeClientset: routeClientset,
-		kubeClientset:  kubeClientset,
-
-		routeInformer:  routeInformer,
-		secretInformer: secretInformer,
-
-		routeLister:  routelistersv1.NewRouteLister(routeInformer.GetIndexer()),
-		secretLister: kcorelistersv1.NewSecretLister(secretInformer.GetIndexer()),
-
-		routeInformerSynced:  routeInformer.HasSynced,
-		secretInformerSynced: secretInformer.HasSynced,
+		routeClient:                 routeClient,
+		routeInformersForNamespaces: routeInformersForNamespaces,
 
 		recorder: eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: ControllerName}),
 
 		queue: workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
-
-		exposerIP:     exposerIP,
-		exposerPort:   exposerPort,
-		selfNamespace: selfNamespace,
-		selfSelector:  selfSelector,
-
-		defaultRouteTermination: defaultRouteTermination,
 	}
 
-	routeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    rc.addRoute,
-		UpdateFunc: rc.updateRoute,
-		DeleteFunc: rc.deleteRoute,
-	})
-	secretInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: rc.updateSecret,
-		DeleteFunc: rc.deleteSecret,
-	})
+	for _, namespace := range routeInformersForNamespaces.Namespaces() {
+		informers := routeInformersForNamespaces.InformersFor(namespace)
+
+		informers.Route().V1().Routes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    rc.addRoute,
+			UpdateFunc: rc.updateRoute,
+			DeleteFunc: rc.deleteRoute,
+		})
+		rc.cachesToSync = append(rc.cachesToSync, informers.Route().V1().Routes().Informer().HasSynced)
+	}
+
+	for _, namespace := range kubeInformersForNamespaces.Namespaces() {
+		informers := kubeInformersForNamespaces.InformersFor(namespace)
+
+		informers.Core().V1().Secrets().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			UpdateFunc: rc.updateSecret,
+			DeleteFunc: rc.deleteSecret,
+		})
+		rc.cachesToSync = append(rc.cachesToSync, informers.Core().V1().Secrets().Informer().HasSynced)
+	}
 
 	return rc
 }
@@ -276,7 +242,7 @@ func (rc *RouteController) resolveControllerRef(namespace string, controllerRef 
 		return nil
 	}
 
-	route, err := rc.routeLister.Routes(namespace).Get(controllerRef.Name)
+	route, err := rc.routeInformersForNamespaces.InformersFor(namespace).Route().V1().Routes().Lister().Routes(namespace).Get(controllerRef.Name)
 	if err != nil {
 		return nil
 	}
@@ -759,20 +725,19 @@ func (rc *RouteController) Run(workers int, stopCh <-chan struct{}) {
 	defer rc.queue.ShutDown()
 
 	klog.Info("Starting Route controller")
+	defer klog.Info("Shutting down Route controller")
 
 	// Wait for all involved caches to be synced, before processing items from the queue is started
-	if !cache.WaitForCacheSync(stopCh, rc.routeInformerSynced, rc.secretInformerSynced) {
+	if !cache.WaitForCacheSync(stopCh, rc.cachesToSync...) {
 		runtime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
 		return
 	}
 
-	klog.Info("Starting Route controller: informer caches synced")
+	klog.Info("Route controller informer caches synced")
 
 	for i := 0; i < workers; i++ {
 		go wait.Until(rc.runWorker, time.Second, stopCh)
 	}
 
 	<-stopCh
-
-	klog.Info("Stopping Route controller")
 }
