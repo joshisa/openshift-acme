@@ -4,17 +4,20 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/rsa"
+	"crypto/sha512"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"reflect"
 	"time"
 
-	routev1 "github.com/openshift/api/route/v1"
-	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
-	_ "github.com/openshift/client-go/route/clientset/versioned/scheme"
 	"golang.org/x/crypto/acme"
+	"k8s.io/client-go/util/retry"
+
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	kapierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -30,7 +33,9 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
 
-	"github.com/tnozicka/openshift-acme/pkg/acme/challengeexposers"
+	routev1 "github.com/openshift/api/route/v1"
+	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
+	_ "github.com/openshift/client-go/route/clientset/versioned/scheme"
 	acmeclient "github.com/tnozicka/openshift-acme/pkg/acme/client"
 	acmeclientbuilder "github.com/tnozicka/openshift-acme/pkg/acme/client/builder"
 	"github.com/tnozicka/openshift-acme/pkg/api"
@@ -59,6 +64,7 @@ var (
 
 type RouteController struct {
 	acmeClientFactory *acmeclientbuilder.SharedClientFactory
+	orderTimeout      time.Duration
 
 	kubeClient                 kubernetes.Interface
 	kubeInformersForNamespaces kubeinformers.Interface
@@ -75,6 +81,7 @@ type RouteController struct {
 
 func NewRouteController(
 	acmeClientFactory *acmeclientbuilder.SharedClientFactory,
+	orderTimeout time.Duration,
 	kubeClient kubernetes.Interface,
 	kubeInformersForNamespaces kubeinformers.Interface,
 	routeClient routeclientset.Interface,
@@ -254,29 +261,9 @@ func (rc *RouteController) resolveControllerRef(namespace string, controllerRef 
 	return route
 }
 
-// TODO: extract this function to be re-used by ingress controller
-// FIXME: needs expectation protection
-func (rc *RouteController) getState(t time.Time, route *routev1.Route, accountUrl string) api.AcmeState {
-	if route.Annotations != nil {
-		_, ok := route.Annotations[api.AcmeAwaitingAuthzUrlAnnotation]
-		if ok {
-			owner, ok := route.Annotations[api.AcmeAwaitingAuthzUrlOwnerAnnotation]
-			if !ok {
-				klog.Warningf("Missing Route with %q annotation is missing %q annotation!", api.AcmeAwaitingAuthzUrlAnnotation, api.AcmeAwaitingAuthzUrlOwnerAnnotation)
-				return api.AcmeStateNeedsCert
-			}
-
-			if owner != accountUrl {
-				klog.Warningf("%s mismatch: authorization owner is %q but current account is %q. This is likely because the acme-account was recreated in the meantime.", api.AcmeAwaitingAuthzUrlOwnerAnnotation, owner, accountUrl)
-				return api.AcmeStateNeedsCert
-			}
-
-			return api.AcmeStateWaitingForAuthz
-		}
-	}
-
+func needsCertKey(t time.Time, route *routev1.Route) (string, error) {
 	if route.Spec.TLS == nil || route.Spec.TLS.Key == "" || route.Spec.TLS.Certificate == "" {
-		return api.AcmeStateNeedsCert
+		return "Route is missing CertKey", nil
 	}
 
 	certPemData := &cert.CertPemData{
@@ -285,18 +272,16 @@ func (rc *RouteController) getState(t time.Time, route *routev1.Route, accountUr
 	}
 	certificate, err := certPemData.Certificate()
 	if err != nil {
-		klog.Errorf("Failed to decode certificate from route %s/%s", route.Namespace, route.Name)
-		return api.AcmeStateNeedsCert
+		return "", fmt.Errorf("can't decode certificate from Route %s/%s: %v", route.Namespace, route.Name, err)
 	}
 
 	err = certificate.VerifyHostname(route.Spec.Host)
 	if err != nil {
-		klog.Errorf("Certificate is invalid for route %s/%s with hostname %q", route.Namespace, route.Name, route.Spec.Host)
-		return api.AcmeStateNeedsCert
+		return "", fmt.Errorf("route %s/%s: existing certificate doesn't match hostname %q", route.Namespace, route.Name, route.Spec.Host)
 	}
 
 	if !cert.IsValid(certificate, t) {
-		return api.AcmeStateNeedsCert
+		return "Already expired", nil
 	}
 
 	// We need to trigger renewals before the certs expire
@@ -305,8 +290,7 @@ func (rc *RouteController) getState(t time.Time, route *routev1.Route, accountUr
 
 	// This is the deadline when we start renewing
 	if remains <= lifetime/3 {
-		klog.Infof("Renewing cert because we reached a deadline of %s", remains)
-		return api.AcmeStateNeedsCert
+		return "In renewal period", nil
 	}
 
 	// In case many certificates were provisioned at specific time
@@ -319,33 +303,69 @@ func (rc *RouteController) getState(t time.Time, route *routev1.Route, accountUr
 		n := r.NormFloat64()*RenewalStandardDeviation + RenewalMean
 		// We use left half of normal distribution (all negative numbers).
 		if n < 0 {
-			klog.V(4).Infof("Renewing cert in advance with %s remaining to spread the load.", remains)
-			return api.AcmeStateNeedsCert
+			return "Proactive renewal", nil
 		}
 	}
 
-	return api.AcmeStateOk
+	return "", nil
 }
 
-func (rc *RouteController) wrapExposers(exposers map[string]challengeexposers.Interface, route *routev1.Route) map[string]challengeexposers.Interface {
-	wrapped := make(map[string]challengeexposers.Interface)
-
-	for k, v := range exposers {
-		if k == "http-01" {
-			wrapped[k] = NewExposer(v, rc.routeClientset, rc.kubeClientset, rc.recorder, rc.exposerIP, rc.exposerPort, rc.selfNamespace, rc.selfSelector, route)
-		} else {
-			wrapped[k] = v
+func (rc *RouteController) getStatus(routeReadOnly *routev1.Route) (*api.Status, error) {
+	status := &api.Status{}
+	if routeReadOnly.Annotations != nil {
+		statusString := routeReadOnly.Annotations[api.AcmeStatusAnnotation]
+		err := json.Unmarshal([]byte(statusString), status)
+		if err != nil {
+			return nil, fmt.Errorf("can't decode status annotation: %v", err)
 		}
 	}
 
-	return wrapped
+	// TODO: verify it matches account hash
+
+	// TODO: verify status signature
+
+	return status, nil
+}
+
+func (rc *RouteController) setStatus(route *routev1.Route, status *api.Status) error {
+	status.ObservedGeneration = route.Generation
+
+	// TODO: sign the status
+
+	bytes, err := json.Marshal(status)
+	if err != nil {
+		return fmt.Errorf("can't encode status annotation: %v", err)
+	}
+
+	metav1.SetMetaDataAnnotation(&route.ObjectMeta, api.AcmeStatusAnnotation, string(bytes))
+
+	return nil
+}
+
+func (rc *RouteController) updateStatus(route *routev1.Route, status *api.Status) error {
+	oldRoute := route.DeepCopy()
+
+	err := rc.setStatus(route, status)
+	if err != nil {
+		return fmt.Errorf("can't set status: %v", err)
+	}
+
+	if reflect.DeepEqual(route, oldRoute) {
+		return nil
+	}
+
+	_, err = rc.routeClient.RouteV1().Routes(route.Namespace).Update(route)
+	if err != nil {
+		return fmt.Errorf("can't update status: %v", err)
+	}
+
+	return nil
 }
 
 // handle is the business logic of the controller.
 // In case an error happened, it has to simply return the error.
 // The retry logic should not be part of the business logic.
 // This function is not meant to be invoked concurrently with the same key.
-// TODO: extract common parts to be re-used by ingress controller
 func (rc *RouteController) handle(key string) error {
 	startTime := time.Now()
 	klog.V(4).Infof("Started syncing Route %q (%v)", key, startTime)
@@ -353,7 +373,13 @@ func (rc *RouteController) handle(key string) error {
 		klog.V(4).Infof("Finished syncing Route %q (%v)", key, time.Since(startTime))
 	}()
 
-	objReadOnly, exists, err := rc.routeIndexer.GetByKey(key)
+	namespace, _, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		runtime.HandleError(err)
+		return err
+	}
+
+	objReadOnly, exists, err := rc.routeInformersForNamespaces.InformersFor(namespace).Route().V1().Routes().Informer().GetIndexer().GetByKey(key)
 	if err != nil {
 		klog.Errorf("Fetching object with key %s from store failed with %v", key, err)
 		return err
@@ -364,10 +390,9 @@ func (rc *RouteController) handle(key string) error {
 		return nil
 	}
 
-	// Deep copy to avoid mutating the cache
 	routeReadOnly := objReadOnly.(*routev1.Route)
 
-	// Don't act on objects that are being deleted
+	// Don't act on objects that are being deleted.
 	if routeReadOnly.DeletionTimestamp != nil {
 		return nil
 	}
@@ -378,200 +403,380 @@ func (rc *RouteController) handle(key string) error {
 		return nil
 	}
 
-	if routeReadOnly.Annotations[api.TlsAcmePausedAnnotation] == "true" {
-		klog.V(4).Infof("Skipping Route %s because it is paused", key)
-
-		// TODO: reconcile (e.g. related secrets)
-		return nil
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), AcmeTimeout)
 	defer cancel()
+
 	client, err := rc.acmeClientFactory.GetClient(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get ACME client: %v", err)
 	}
-	state := rc.getState(startTime, routeReadOnly, client.Account.URI)
-	// FIXME: this state machine needs protection with expectations
-	// (informers may not be synced yet with recent state transition updates)
-	switch state {
-	case api.AcmeStateNeedsCert:
-		// TODO: Add TTL based lock to allow only one domain to enter this stage
 
-		// FIXME: definitely protect with expectations
-		authorization, err := client.Client.Authorize(ctx, routeReadOnly.Spec.Host)
+	status, err := rc.getStatus(routeReadOnly)
+	if err != nil {
+		return fmt.Errorf("can't get status: %v", err)
+	}
+
+	if status.ProvisioningStatus == nil {
+		reason, err := needsCertKey(time.Now(), routeReadOnly)
 		if err != nil {
-			return fmt.Errorf("failed to authorize domain %q: %v", routeReadOnly.Spec.Host, err)
+			return err
 		}
-		klog.V(4).Infof("Created authorization %q for Route %s", authorization.URI, key)
 
-		if authorization.Status == acme.StatusValid {
-			klog.V(4).Infof("Authorization %q for Route %s is already valid", authorization.URI, key)
+		if len(reason) == 0 {
+			// Not eligible for renewal
+			klog.V(4).Infof("Route %q doesn't need new cert: %v", key)
+			return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+		}
+
+		klog.V(1).Infof("Route %q needs new cert: %v", key, reason)
+	}
+
+	domain := routeReadOnly.Spec.Host
+
+	if status.ProvisioningStatus == nil || len(status.ProvisioningStatus.OrderUri) == 0 {
+		order, err := client.Client.AuthorizeOrder(ctx, acme.DomainIDs(domain))
+		if err != nil {
+			return err
+		}
+		klog.V(1).Infof("Created Order %q for Route %q", order.URI, key)
+
+		// We need to store the order URI immediately to prevent loosing it on error.
+		// Updating the route will make it requeue.
+		status.ProvisioningStatus.StartedAt = time.Now()
+		status.ProvisioningStatus.OrderUri = order.URI
+		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+	}
+
+	// Clear stuck provisioning
+	if time.Now().After(status.ProvisioningStatus.StartedAt.Add(rc.orderTimeout)) {
+		klog.Warning("Route %q: Clearing stuck order %q", key, status.ProvisioningStatus.OrderUri)
+		status.ProvisioningStatus = nil
+		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+	}
+
+	order, err := client.Client.GetOrder(ctx, status.ProvisioningStatus.OrderUri)
+	if err != nil {
+		acmeErr, ok := err.(*acme.Error)
+		if !ok || acmeErr.StatusCode != http.StatusNotFound {
+			return err
+		}
+
+		// The order URI doesn't exist. Delete OrderUri and update the status.
+		klog.Warning("Route %q: Found invalid OrderURI %q, removing it.", key, status.ProvisioningStatus.OrderUri)
+		status.ProvisioningStatus.OrderUri = ""
+		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+	}
+
+	status.ProvisioningStatus.OrderStatus = order.Status
+
+	klog.V(4).Infof("Route %q: Order %q is in %q state", key, order.URI, order.Status)
+
+	switch order.Status {
+	case acme.StatusPending:
+		// Satisfy all pending authorizations.
+		klog.V(4).Infof("Route %q: Order %q contains %d authorization(s)", key, order.URI, len(order.AuthzURLs))
+
+		for _, authzUrl := range order.AuthzURLs {
+			authz, err := client.Client.GetAuthorization(ctx, authzUrl)
+			if err != nil {
+				return err
+			}
+
+			klog.V(4).Infof("Route %q: order %q: authz %q: is in %q state", key, order.URI, authz.URI, authz.Status)
+
+			switch authz.Status {
+			case acme.StatusPending:
+				break
+
+			case acme.StatusValid, acme.StatusInvalid, acme.StatusDeactivated, acme.StatusExpired, acme.StatusRevoked:
+				continue
+
+			default:
+				return fmt.Errorf("route %q: order %q: authz %q has invalid status %q", key, order.URI, authz.URI, authz.Status)
+			}
+
+			// Authz is Pending
+
+			var challenge *acme.Challenge
+			for _, c := range authz.Challenges {
+				if c.Type == "http-01" {
+					challenge = c
+				}
+			}
+
+			if challenge == nil {
+				// TODO: emit an event
+				return fmt.Errorf("route %q: unable to satisfy authorization %q for domain %q: no viable challenge type found in %v", key, authz.URI, domain, authz.Challenges)
+			}
+
+			klog.V(4).Infof("route %q: order %q: authz %q: challenge %q is in %q state", key, order.URI, authz.URI, authz.Status, challenge.Status)
+
+			switch challenge.Status {
+			case acme.StatusPending:
+				tmpName := getTemporaryName(routeReadOnly.Name + ":" + order.URI + ":" + authzUrl + ":" + challenge.URI)
+
+				/*
+				 * Route
+				 */
+				trueVal := true
+				desiredExposerRoute := routeReadOnly.DeepCopy()
+				desiredExposerRoute.Name = tmpName
+				desiredExposerRoute.ResourceVersion = ""
+				desiredExposerRoute.OwnerReferences = []metav1.OwnerReference{
+					{
+						APIVersion: routev1.SchemeGroupVersion.String(),
+						Kind:       "Route",
+						Name:       routeReadOnly.Name,
+						UID:        routeReadOnly.UID,
+						Controller: &trueVal,
+					},
+				}
+				if desiredExposerRoute.Labels == nil {
+					desiredExposerRoute.Labels = map[string]string{}
+				}
+				desiredExposerRoute.Labels[api.AcmeTemporaryLabel] = "true"
+				desiredExposerRoute.Spec.Path = client.Client.HTTP01ChallengePath(challenge.Token)
+				desiredExposerRoute.Spec.To = routev1.RouteTargetReference{
+					Kind: "Service",
+					Name: tmpName,
+				}
+
+				exposerRoute, err := rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Create(desiredExposerRoute)
+				if err != nil {
+					if kapierrors.IsAlreadyExists(err) {
+						err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+							exposerRoute, err = rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Get(desiredExposerRoute.Name, metav1.GetOptions{})
+							if err != nil {
+								return err
+							}
+
+							if !metav1.IsControlledBy(exposerRoute, routeReadOnly) {
+								return fmt.Errorf("exposer Route %s/%s already exists and isn't owned by route %s", exposerRoute.Namespace, exposerRoute.Name, key)
+							}
+
+							// Replace whatever is there
+							desiredExposerRoute.ResourceVersion = exposerRoute.ResourceVersion
+							exposerRoute, err = rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Update(desiredExposerRoute)
+							if err != nil {
+								return err
+							}
+							return nil
+						})
+						if err != nil {
+							return err
+						}
+					} else {
+						return err
+					}
+				}
+
+				ownerRefToExposerRoute := metav1.OwnerReference{
+					APIVersion: corev1.SchemeGroupVersion.String(),
+					Kind:       "Route",
+					Name:       exposerRoute.Name,
+					UID:        exposerRoute.UID,
+				}
+
+				/*
+				 * ReplicaSet
+				 */
+				var replicas int32 = 2
+				podLabels := map[string]string{
+					"app": tmpName,
+				}
+				podSelector := &metav1.LabelSelector{
+					MatchLabels: podLabels,
+				}
+				desiredExposerRS := &appsv1.ReplicaSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            tmpName,
+						OwnerReferences: []metav1.OwnerReference{ownerRefToExposerRoute},
+						Labels: map[string]string{
+							api.AcmeTemporaryLabel: "true",
+						},
+					},
+					Spec: appsv1.ReplicaSetSpec{
+						Replicas: &replicas,
+						Selector: podSelector,
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Labels: podLabels,
+							},
+							Spec: corev1.PodSpec{},
+						},
+					},
+				}
+				exposerRS, err := rc.kubeClient.AppsV1().ReplicaSets(routeReadOnly.Namespace).Create(desiredExposerRS)
+				if err != nil {
+					if kapierrors.IsAlreadyExists(err) {
+						err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+							exposerRS, err = rc.kubeClient.AppsV1().ReplicaSets(routeReadOnly.Namespace).Get(desiredExposerRS.Name, metav1.GetOptions{})
+							if err != nil {
+								return err
+							}
+
+							if !metav1.IsControlledBy(exposerRS, routeReadOnly) {
+								return fmt.Errorf("pod %s/%s already exists and isn't owned by route %s", exposerRS.Namespace, exposerRS.Name, key)
+							}
+
+							// Replace whatever is there
+							desiredExposerRS.ResourceVersion = exposerRS.ResourceVersion
+							exposerRS, err = rc.kubeClient.AppsV1().ReplicaSets(routeReadOnly.Namespace).Update(desiredExposerRS)
+							if err != nil {
+								return err
+							}
+							return nil
+						})
+						if err != nil {
+							return err
+						}
+					} else {
+						return err
+					}
+				}
+
+				/*
+				 * Service
+				 */
+				desiredExposerService := &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            tmpName,
+						OwnerReferences: []metav1.OwnerReference{ownerRefToExposerRoute},
+						Labels: map[string]string{
+							api.AcmeTemporaryLabel: "true",
+						},
+					},
+					Spec: corev1.ServiceSpec{
+						Selector: podLabels,
+						Type:     corev1.ServiceTypeClusterIP,
+					},
+				}
+				exposerService, err := rc.kubeClient.CoreV1().Services(routeReadOnly.Namespace).Create(desiredExposerService)
+				if err != nil {
+					if kapierrors.IsAlreadyExists(err) {
+						err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+							exposerService, err = rc.kubeClient.CoreV1().Services(routeReadOnly.Namespace).Get(desiredExposerService.Name, metav1.GetOptions{})
+							if err != nil {
+								return err
+							}
+
+							if !metav1.IsControlledBy(exposerService, routeReadOnly) {
+								return fmt.Errorf("pod %s/%s already exists and isn't owned by route %s", exposerService.Namespace, exposerService.Name, key)
+							}
+
+							// Replace whatever is there
+							desiredExposerService.ResourceVersion = exposerService.ResourceVersion
+							exposerService, err = rc.kubeClient.CoreV1().Services(routeReadOnly.Namespace).Update(desiredExposerService)
+							if err != nil {
+								return err
+							}
+							return nil
+						})
+						if err != nil {
+							return err
+						}
+					} else {
+						return err
+					}
+				}
+
+				// TODO: wait for pods to run and report into status, requeue
+				// For now, the server is bound to retry the verification by RFC8555
+				// so on happy path there shouldn't be issues. But pods can get stuck
+				// on scheduling, quota, resources, ... and we want to know why the validation fails.
+
+				_, err = client.Client.Accept(ctx, challenge)
+				if err != nil {
+					return err
+				}
+
+			case acme.StatusProcessing, acme.StatusValid, acme.StatusInvalid:
+				// These states will manifest into global order state over time.
+				// We only need to attend to pending states.
+				// We could possibly report events for those but is seems too fine grained now.
+				continue
+
+			default:
+				return fmt.Errorf("route %q: order %q: authz %q: invalid status %q for challenge %q", key, order.URI, authz.URI, challenge.Status, challenge.URI)
+			}
+		}
+
+		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+
+	case acme.StatusValid:
+		// FIXME: should be separate step after acme.StatusReady - needs fixing golang acme lib
+		fallthrough
+	case acme.StatusReady:
+		klog.V(3).Infof("Route %q: Order %q successfully validated", key, order.URI)
+		template := x509.CertificateRequest{
+			Subject: pkix.Name{
+				CommonName: routeReadOnly.Spec.Host,
+			},
+		}
+		template.DNSNames = append(template.DNSNames, routeReadOnly.Spec.Host)
+		klog.V(4).Infof("Route %q: Order %q: CSR template: %#v", template)
+		privateKey, err := rsa.GenerateKey(cryptorand.Reader, 4096)
+		if err != nil {
+			return fmt.Errorf("failed to generate RSA key: %v", err)
+		}
+
+		csr, err := x509.CreateCertificateRequest(cryptorand.Reader, &template, privateKey)
+		if err != nil {
+			return fmt.Errorf("failed to create certificate request: %v", err)
+		}
+		klog.V(4).Infof("Route %q: Order %q: CSR: %#v", key, order.URI, string(csr))
+
+		// Send CSR
+		// FIXME: Unfortunately golang also waits in this method for the cert creation
+		//  although that should be asynchronous. Requires fixing golang lib. (The helpers used are private.)
+		der, certUrl, err := client.Client.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
+		if err != nil {
+			return err
+		}
+
+		klog.V(4).Infof("Route %q: Order %q: Certificate available at %q", key, order.URI, certUrl)
+
+		certPemData, err := cert.NewCertificateFromDER(der, privateKey)
+		if err != nil {
+			return fmt.Errorf("can't convert certificate from DER to PEM: %v", err)
 		}
 
 		route := routeReadOnly.DeepCopy()
-		if route.Annotations == nil {
-			route.Annotations = make(map[string]string)
+		if route.Spec.TLS == nil {
+			route.Spec.TLS = &routev1.TLSConfig{
+				// Defaults
+				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
+				Termination:                   routev1.TLSTerminationEdge,
+			}
 		}
-		route.Annotations[api.AcmeAwaitingAuthzUrlAnnotation] = authorization.URI
-		route.Annotations[api.AcmeAwaitingAuthzUrlOwnerAnnotation] = client.Account.URI
-		// TODO: convert to PATCH to avoid loosing time and rate limits on update collisions
-		_, err = rc.routeClientset.RouteV1().Routes(route.Namespace).Update(route)
+		route.Spec.TLS.Key = string(certPemData.Key)
+		route.Spec.TLS.Certificate = string(certPemData.Crt)
+
+		_, err = rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Update(route)
 		if err != nil {
-			klog.Errorf("Failed to update Route %s: %v. Revoking authorization %q so it won't stay pending.", key, err, authorization.URI)
-			// We need to try to cancel the authorization so we don't leave pending authorization behind and get rate limited
-			acmeErr := client.Client.RevokeAuthorization(ctx, authorization.URI)
-			if acmeErr != nil {
-				klog.Errorf("Failed to revoke authorization %q: %v", authorization.URI, acmeErr)
-			}
-
-			return fmt.Errorf("failed to update authorizationURI: %v", err)
+			return fmt.Errorf("can't update route %s/%s with new certificates: %v", routeReadOnly.Namespace, route.Name, err)
 		}
 
-		return nil
+		status.ProvisioningStatus = nil
 
-	case api.AcmeStateWaitingForAuthz:
-		ctx, cancel := context.WithTimeout(context.Background(), AcmeTimeout)
-		defer cancel()
+		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 
-		client, err := rc.acmeClientFactory.GetClient(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get ACME client: %v", err)
-		}
+	case acme.StatusProcessing:
+		// TODO: backoff but capped at some reasonable time
+		rc.queue.AddAfter(routeReadOnly, 15*time.Second)
 
-		authorizationUri := routeReadOnly.Annotations[api.AcmeAwaitingAuthzUrlAnnotation]
-		authorization, err := client.Client.GetAuthorization(ctx, authorizationUri)
-		// TODO: emit an event but don't fail as user can set it
-		if err != nil {
-			return fmt.Errorf("failed to get ACME authorization: %v", err)
-		}
+		klog.V(4).Infof("Route %q: Order %q: Waiting to be validated by ACME server")
 
-		klog.V(4).Infof("Route %q: authorization state is %q", key, authorization.Status)
+		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 
-		exposers := rc.wrapExposers(rc.exposers, routeReadOnly)
+	case acme.StatusInvalid:
+		rc.recorder.Eventf(routeReadOnly, corev1.EventTypeWarning, "AcmeFailedAuthorization", "Acme provider failed to validate domain %q: %s", routeReadOnly.Spec.Host, acmeclient.GetAuthorizationErrors(authorization))
 
-		switch authorization.Status {
-		case acme.StatusPending:
-			authorization, err := client.AcceptAuthorization(ctx, authorization, routeReadOnly.Spec.Host, exposers)
-			if err != nil {
-				return fmt.Errorf("failed to accept ACME authorization: %v", err)
-			}
+		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 
-			if authorization.Status == acme.StatusPending {
-				klog.V(4).Infof("Re-queuing Route %q due to pending authorization", key)
-
-				// TODO: get this value from authorization when this is fixed
-				// https://github.com/golang/go/issues/22457
-				retryAfter := 5 * time.Second
-				rc.queue.AddAfter(key, retryAfter)
-
-				// Don't count this as requeue, reset counter
-				rc.queue.Forget(key)
-
-				return nil
-			}
-
-			if authorization.Status != acme.StatusValid {
-				return fmt.Errorf("route %q - authorization has transitioned to unexpected state %q", key, authorization.Status)
-			}
-
-			fallthrough
-
-		case acme.StatusValid:
-			klog.V(4).Infof("Authorization %q for Route %s successfully validated", authorization.URI, key)
-			// provision cert
-			template := x509.CertificateRequest{
-				Subject: pkix.Name{
-					CommonName: routeReadOnly.Spec.Host,
-				},
-			}
-			template.DNSNames = append(template.DNSNames, routeReadOnly.Spec.Host)
-			klog.Infof("template: %#v", template)
-			privateKey, err := rsa.GenerateKey(cryptorand.Reader, 4096)
-			if err != nil {
-				return fmt.Errorf("failed to generate RSA key: %v", err)
-			}
-
-			csr, err := x509.CreateCertificateRequest(cryptorand.Reader, &template, privateKey)
-			if err != nil {
-				return fmt.Errorf("failed to create certificate request: %v", err)
-			}
-			klog.Infof("csr: %#v", string(csr))
-
-			// TODO: protect with expectations
-			// TODO: aks to split CreateCert func in acme library to avoid embedded pooling
-			der, certUrl, err := client.Client.CreateCert(ctx, csr, 0, true)
-			if err != nil {
-				return fmt.Errorf("failed to create ACME certificate: %v", err)
-			}
-			klog.V(4).Infof("Route %q - created certificate available at %s", key, certUrl)
-
-			certPemData, err := cert.NewCertificateFromDER(der, privateKey)
-			if err != nil {
-				return fmt.Errorf("failed to convert certificate from DER to PEM: %v", err)
-			}
-
-			route := routeReadOnly.DeepCopy()
-			if route.Spec.TLS == nil {
-				route.Spec.TLS = &routev1.TLSConfig{
-					// Defaults
-					InsecureEdgeTerminationPolicy: rc.defaultRouteTermination,
-					Termination:                   routev1.TLSTerminationEdge,
-				}
-			}
-			route.Spec.TLS.Key = string(certPemData.Key)
-			route.Spec.TLS.Certificate = string(certPemData.Crt)
-
-			delete(route.Annotations, api.AcmeAwaitingAuthzUrlAnnotation)
-
-			updatedRoute, err := rc.routeClientset.RouteV1().Routes(route.Namespace).Update(route)
-			if err != nil {
-				return fmt.Errorf("failed to update route %s/%s with new certificates: %v", route.Namespace, route.Name, err)
-			}
-
-			rc.recorder.Event(updatedRoute, corev1.EventTypeNormal, "AcmeCertificateProvisioned", "Successfully provided new certificate")
-
-			// Clean up tmp objects on success.
-			// We should make this more smart when we support more exposers.
-			for _, exposer := range exposers {
-				exposer.Remove(routeReadOnly.Spec.Host)
-			}
-
-		case acme.StatusInvalid:
-			rc.recorder.Eventf(routeReadOnly, corev1.EventTypeWarning, "AcmeFailedAuthorization", "Acme provider failed to validate domain %q: %s", routeReadOnly.Spec.Host, acmeclient.GetAuthorizationErrors(authorization))
-
-			route := routeReadOnly.DeepCopy()
-			delete(route.Annotations, api.AcmeAwaitingAuthzUrlAnnotation)
-			// TODO: remove force pausing when we have ACME rate limiter
-			route.Annotations[api.TlsAcmePausedAnnotation] = "true"
-			route, err = rc.routeClientset.RouteV1().Routes(route.Namespace).Update(route)
-			if err != nil {
-				return fmt.Errorf("failed to pause Route: %v", err)
-			}
-
-		case acme.StatusRevoked:
-			rc.recorder.Eventf(routeReadOnly, corev1.EventTypeWarning, "AcmeRevokedAuthorization", "Acme authorization has been revoked for domain %q", routeReadOnly.Spec.Host)
-
-		case "deactivated":
-			klog.V(4).Infof("Authorization %q is %s.", authorization.URI, authorization.Status)
-
-		case acme.StatusProcessing:
-			fallthrough
-		default:
-			return fmt.Errorf("unknow authorization status %s", authorization.Status)
-		}
-
-	case api.AcmeStateOk:
 	default:
-		return fmt.Errorf("failed to determine state for Route: %#v", routeReadOnly)
+		return fmt.Errorf("route %q: invalid new order status %q; order URL: %q", key, order.Status, order.URI)
 	}
-
-	err = rc.syncSecret(routeReadOnly)
-	if err != nil {
-		return fmt.Errorf("failed to sync secret for Route %s/%s: %v", routeReadOnly.Namespace, routeReadOnly.Name, err)
-	}
-
-	return nil
 }
 
 func (rc *RouteController) syncSecret(routeReadOnly *routev1.Route) error {
@@ -579,7 +784,7 @@ func (rc *RouteController) syncSecret(routeReadOnly *routev1.Route) error {
 	secretName := routeReadOnly.Name
 
 	secretExists := true
-	oldSecret, err := rc.secretLister.Secrets(routeReadOnly.Namespace).Get(secretName)
+	oldSecret, err := rc.kubeInformersForNamespaces.InformersFor(routeReadOnly.Namespace).Core().V1().Secrets().Lister().Secrets(routeReadOnly.Namespace).Get(secretName)
 	if err != nil {
 		if !kapierrors.IsNotFound(err) {
 			return fmt.Errorf("failed to get Secret %s/%s: %v", routeReadOnly.Namespace, secretName, err)
@@ -606,7 +811,7 @@ func (rc *RouteController) syncSecret(routeReadOnly *routev1.Route) error {
 		preconditions := metav1.Preconditions{
 			UID: &oldSecret.UID,
 		}
-		err := rc.kubeClientset.CoreV1().Secrets(routeReadOnly.Namespace).Delete(secretName, &metav1.DeleteOptions{
+		err := rc.kubeClient.CoreV1().Secrets(routeReadOnly.Namespace).Delete(secretName, &metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
 			PropagationPolicy:  &propagationPolicy,
 			Preconditions:      &preconditions,
@@ -652,7 +857,7 @@ func (rc *RouteController) syncSecret(routeReadOnly *routev1.Route) error {
 	newSecret.Data[corev1.TLSPrivateKeyKey] = []byte(routeReadOnly.Spec.TLS.Key)
 
 	if !secretExists {
-		_, err = rc.kubeClientset.CoreV1().Secrets(routeReadOnly.Namespace).Create(newSecret)
+		_, err = rc.kubeClient.CoreV1().Secrets(routeReadOnly.Namespace).Create(newSecret)
 		if err != nil {
 			return fmt.Errorf("failed to create Secret %s/%s with TLS data: %v", routeReadOnly.Namespace, newSecret.Name, err)
 		}
@@ -661,7 +866,7 @@ func (rc *RouteController) syncSecret(routeReadOnly *routev1.Route) error {
 	}
 
 	if !reflect.DeepEqual(oldSecret, newSecret) {
-		_, err = rc.kubeClientset.CoreV1().Secrets(routeReadOnly.Namespace).Update(newSecret)
+		_, err = rc.kubeClient.CoreV1().Secrets(routeReadOnly.Namespace).Update(newSecret)
 		if err != nil {
 			return fmt.Errorf("failed to update Secret %s/%s with TLS data: %v", routeReadOnly.Namespace, newSecret.Name, err)
 		}
@@ -740,4 +945,8 @@ func (rc *RouteController) Run(workers int, stopCh <-chan struct{}) {
 	}
 
 	<-stopCh
+}
+
+func getTemporaryName(key string) string {
+	return fmt.Sprintf("acme-exposer-%s", sha512.Sum512([]byte(key)))
 }

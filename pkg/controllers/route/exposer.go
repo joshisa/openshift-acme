@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	routev1 "github.com/openshift/api/route/v1"
@@ -19,7 +18,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
@@ -134,20 +132,6 @@ func (e *Exposer) cleanupTmpObjects() error {
 	}
 
 	return nil
-}
-
-func createTemporaryExposerName(routeName string) string {
-	baseName := fmt.Sprintf("%s-%s-", routeName, api.ForwardingRouteSuffix)
-
-	// We need to normalize the name from possible DNSSubdomain (allowed for Route's name)
-	// to DNSLabel (allowed for regular Kubernetes objects)
-	baseName = strings.Replace(baseName, ".", "-", -1)
-
-	if len(baseName) > maxGeneratedNameLength {
-		baseName = baseName[:maxGeneratedNameLength]
-	}
-
-	return fmt.Sprintf("%s%s", baseName, utilrand.String(randomLength))
 }
 
 func (e *Exposer) Expose(c *acme.Client, domain string, token string) error {

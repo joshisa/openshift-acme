@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -45,6 +46,7 @@ type Options struct {
 	Namespaces                  []string
 	AcmeUrl                     string
 	AcmeAccountSecret           string
+	AcmeOrderTimeout            time.Duration
 
 	restConfig  *restclient.Config
 	kubeClient  kubernetes.Interface
@@ -63,7 +65,9 @@ func NewOptions(streams genericclioptions.IOStreams) *Options {
 
 		AcmeUrl:           "https://acme-staging.api.letsencrypt.org/directory",
 		AcmeAccountSecret: "acme-account",
-		Namespaces:        []string{metav1.NamespaceAll},
+		AcmeOrderTimeout:  5 * time.Minute,
+
+		Namespaces: []string{metav1.NamespaceAll},
 	}
 }
 
@@ -109,16 +113,18 @@ func NewOpenshiftAcmeControllerCommand(streams genericclioptions.IOStreams) *cob
 
 	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
+	rootCmd.PersistentFlags().IntVarP(&o.Workers, "workers", "", o.Workers, "Number of workers to run")
 	rootCmd.PersistentFlags().StringVarP(&o.Kubeconfig, "kubeconfig", "", o.Kubeconfig, "Path to the kubeconfig file")
 	rootCmd.PersistentFlags().StringVarP(&o.ControllerNamespace, "controller-namespace", "", o.ControllerNamespace, "Namespace where the controller is running. Autodetected if run inside a cluster.")
+	rootCmd.PersistentFlags().StringArrayVarP(&o.Namespaces, "namespace", "n", o.Namespaces, "Restricts controller to namespace(s). If not specified controller watches all namespaces.")
 
 	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionLeaseDuration, "leaderelection-lease-duration", "LeaseDuration is the duration that non-leader candidates will wait to force acquire leadership.", o.LeaderelectionLeaseDuration, "")
 	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionRenewDeadline, "leaderelection-renew-deadline", "RenewDeadline is the duration that the acting master will retry refreshing leadership before giving up.", o.LeaderelectionRenewDeadline, "")
 	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionRetryPeriod, "leaderelection-retry-period", "RetryPeriod is the duration the LeaderElector clients should wait between tries of actions.", o.LeaderelectionRetryPeriod, "")
 
 	rootCmd.PersistentFlags().StringVarP(&o.AcmeUrl, "acmeurl", "", o.AcmeUrl, "ACME URL like https://acme-v02.api.letsencrypt.org/directory")
-	rootCmd.PersistentFlags().StringArrayVarP(&o.Namespaces, "namespace", "n", o.Namespaces, "Restricts controller to namespace(s). If not specified controller watches all namespaces.")
 	rootCmd.PersistentFlags().StringVarP(&o.AcmeAccountSecret, "acme-account-secret", "", o.AcmeAccountSecret, "Name of the Secret holding ACME account.")
+	rootCmd.PersistentFlags().DurationVarP(&o.AcmeOrderTimeout, "acme-order-timeout", "", o.AcmeOrderTimeout, "Name of the Secret holding ACME account.")
 
 	cmdutil.InstallKlog(rootCmd)
 
@@ -165,7 +171,7 @@ func (o *Options) Complete() error {
 		klog.V(1).Infof("No kubeconfig specified, using InClusterConfig.")
 		o.restConfig, err = restclient.InClusterConfig()
 		if err != nil {
-			klog.Fatalf("Failed to create InClusterConfig: %v", err)
+			return fmt.Errorf("can't create InClusterConfig: %v", err)
 		}
 	}
 
@@ -267,11 +273,17 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 	kubeInformersForNamespaces.Start(stopCh)
 	routeInformersForNamespaces.Start(stopCh)
 
-	go rc.Run(o.Workers, stopCh)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rc.Run(o.Workers, stopCh)
+	}()
 
 	<-stopCh
 
-	// TODO: We should wait for controllers to stop
+	klog.Info("Waiting for controllers to finish...")
+	wg.Wait()
 
 	klog.Flush()
 
