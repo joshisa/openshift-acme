@@ -25,10 +25,10 @@ import (
 
 	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
 
-	acmeclientbuilder "github.com/tnozicka/openshift-acme/pkg/acme/client/builder"
 	"github.com/tnozicka/openshift-acme/pkg/cmd/genericclioptions"
 	cmdutil "github.com/tnozicka/openshift-acme/pkg/cmd/util"
-	routecontroller "github.com/tnozicka/openshift-acme/pkg/controllers/route"
+	acmeissuer "github.com/tnozicka/openshift-acme/pkg/controller/issuer/acme"
+	routecontroller "github.com/tnozicka/openshift-acme/pkg/controller/route"
 	kubeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/kube"
 	routeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/route"
 	"github.com/tnozicka/openshift-acme/pkg/signals"
@@ -44,9 +44,9 @@ type Options struct {
 	LeaderelectionRenewDeadline time.Duration
 	LeaderelectionRetryPeriod   time.Duration
 	Namespaces                  []string
-	AcmeUrl                     string
-	AcmeAccountSecret           string
 	AcmeOrderTimeout            time.Duration
+
+	ExposerImage string
 
 	restConfig  *restclient.Config
 	kubeClient  kubernetes.Interface
@@ -63,9 +63,9 @@ func NewOptions(streams genericclioptions.IOStreams) *Options {
 		LeaderelectionRenewDeadline: 10 * time.Second,
 		LeaderelectionRetryPeriod:   2 * time.Second,
 
-		AcmeUrl:           "https://acme-staging.api.letsencrypt.org/directory",
-		AcmeAccountSecret: "acme-account",
-		AcmeOrderTimeout:  5 * time.Minute,
+		AcmeOrderTimeout: 5 * time.Minute,
+
+		ExposerImage: "",
 
 		Namespaces: []string{metav1.NamespaceAll},
 	}
@@ -122,9 +122,7 @@ func NewOpenshiftAcmeControllerCommand(streams genericclioptions.IOStreams) *cob
 	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionRenewDeadline, "leaderelection-renew-deadline", "RenewDeadline is the duration that the acting master will retry refreshing leadership before giving up.", o.LeaderelectionRenewDeadline, "")
 	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionRetryPeriod, "leaderelection-retry-period", "RetryPeriod is the duration the LeaderElector clients should wait between tries of actions.", o.LeaderelectionRetryPeriod, "")
 
-	rootCmd.PersistentFlags().StringVarP(&o.AcmeUrl, "acmeurl", "", o.AcmeUrl, "ACME URL like https://acme-v02.api.letsencrypt.org/directory")
-	rootCmd.PersistentFlags().StringVarP(&o.AcmeAccountSecret, "acme-account-secret", "", o.AcmeAccountSecret, "Name of the Secret holding ACME account.")
-	rootCmd.PersistentFlags().DurationVarP(&o.AcmeOrderTimeout, "acme-order-timeout", "", o.AcmeOrderTimeout, "Name of the Secret holding ACME account.")
+	rootCmd.PersistentFlags().StringVarP(&o.ExposerImage, "exposer-image", "", o.ExposerImage, "Image to use for exposing tokens for http based validation. (In standard configuration this contains openshift-acme-exposer binary, but the API is generic.)")
 
 	cmdutil.InstallKlog(rootCmd)
 
@@ -144,12 +142,13 @@ func (o *Options) Validate() error {
 		return errors.NewAggregate(errs)
 	}
 
-	if o.AcmeAccountSecret == "" {
-		return fmt.Errorf("acme account secret name can't be empty string")
-	}
-	errStrings := kvalidation.NameIsDNSSubdomain(o.AcmeAccountSecret, false)
-	if len(errs) > 0 {
-		return fmt.Errorf("acme account secret name is invalid: %s", strings.Join(errStrings, ", "))
+	// errStrings := kvalidation.NameIsDNSSubdomain(o.AcmeAccountSecret, false)
+	// if len(errs) > 0 {
+	// 	return fmt.Errorf("acme account secret name is invalid: %s", strings.Join(errStrings, ", "))
+	// }
+
+	if len(o.ExposerImage) == 0 {
+		return fmt.Errorf("exposer image not specified")
 	}
 
 	// TODO
@@ -165,13 +164,13 @@ func (o *Options) Complete() error {
 		o.restConfig, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 			&clientcmd.ClientConfigLoadingRules{ExplicitPath: o.Kubeconfig}, &clientcmd.ConfigOverrides{}).ClientConfig()
 		if err != nil {
-			return fmt.Errorf("can't create config from kubeConfigPath %q: %v", o.Kubeconfig, err)
+			return fmt.Errorf("can't create config from kubeConfigPath %q: %w", o.Kubeconfig, err)
 		}
 	} else {
 		klog.V(1).Infof("No kubeconfig specified, using InClusterConfig.")
 		o.restConfig, err = restclient.InClusterConfig()
 		if err != nil {
-			return fmt.Errorf("can't create InClusterConfig: %v", err)
+			return fmt.Errorf("can't create InClusterConfig: %w", err)
 		}
 	}
 
@@ -179,25 +178,37 @@ func (o *Options) Complete() error {
 		// Autodetect if running inside a cluster
 		bytes, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 		if err != nil {
-			return fmt.Errorf("can't autodetect controller namespace: %v", err)
+			return fmt.Errorf("can't autodetect controller namespace: %w", err)
 		}
 		o.ControllerNamespace = string(bytes)
 	}
 
 	o.kubeClient, err = kubernetes.NewForConfig(o.restConfig)
 	if err != nil {
-		return fmt.Errorf("can't build kubernetes clientset: %v", err)
+		return fmt.Errorf("can't build kubernetes clientset: %w", err)
 	}
 
 	o.routeClient, err = routeclientset.NewForConfig(o.restConfig)
 	if err != nil {
-		return fmt.Errorf("can't build route clientset: %v", err)
+		return fmt.Errorf("can't build route clientset: %w", err)
 	}
 
 	if len(o.Namespaces) == 0 {
 		// empty namespace will lead to creating cluster wide informers
 		o.Namespaces = []string{metav1.NamespaceAll}
+	} else {
+		seen := map[string]struct{}{}
+		var uniqueNamespaces []string
+		for _, ns := range o.Namespaces {
+			_, ok := seen[ns]
+			if !ok {
+				uniqueNamespaces = append(uniqueNamespaces, ns)
+				seen[ns] = struct{}{}
+			}
+		}
+		o.Namespaces = uniqueNamespaces
 	}
+	klog.V(1).Info("Managing namespaces: %v", o.Namespaces)
 
 	return nil
 }
@@ -261,23 +272,29 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 	}
 
 	klog.Infof("loglevel is set to %q", cmdutil.GetLoglevel())
-	klog.Infof("Using ACME server URL %q", o.AcmeUrl)
 
 	kubeInformersForNamespaces := kubeinformers.NewKubeInformersForNamespaces(o.kubeClient, o.Namespaces)
 	routeInformersForNamespaces := routeinformers.NewRouteInformersForNamespaces(o.routeClient, o.Namespaces)
 
-	acmeClientFactory := acmeclientbuilder.NewSharedClientFactory(o.AcmeUrl, o.AcmeAccountSecret, o.ControllerNamespace, o.kubeClient, kubeInformersForNamespaces.InformersFor(o.ControllerNamespace).Core().V1().Secrets().Lister())
+	ac := acmeissuer.NewAccountController(o.kubeClient, kubeInformersForNamespaces)
 
-	rc := routecontroller.NewRouteController(acmeClientFactory, o.kubeClient, kubeInformersForNamespaces, o.routeClient, routeInformersForNamespaces)
+	rc := routecontroller.NewRouteController(o.AcmeOrderTimeout, o.ExposerImage, o.kubeClient, kubeInformersForNamespaces, o.routeClient, routeInformersForNamespaces)
 
 	kubeInformersForNamespaces.Start(stopCh)
 	routeInformersForNamespaces.Start(stopCh)
 
 	var wg sync.WaitGroup
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		rc.Run(o.Workers, stopCh)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ac.Run(o.Workers, stopCh)
 	}()
 
 	<-stopCh

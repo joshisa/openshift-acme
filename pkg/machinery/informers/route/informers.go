@@ -3,11 +3,13 @@ package kube
 import (
 	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
 	routeinformers "github.com/openshift/client-go/route/informers/externalversions"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type Interface interface {
 	Start(stopCh <-chan struct{})
 	InformersFor(namespace string) routeinformers.SharedInformerFactory
+	InformersForOrGlobal(namespace string) routeinformers.SharedInformerFactory
 	Namespaces() []string
 }
 
@@ -33,13 +35,22 @@ func (i routeInformersForNamespaces) Start(stopCh <-chan struct{}) {
 
 func (i routeInformersForNamespaces) Namespaces() []string {
 	var ns []string
-	for n, _ := range i {
+	for n := range i {
 		ns = append(ns, n)
 	}
 	return ns
 }
+
 func (i routeInformersForNamespaces) InformersFor(namespace string) routeinformers.SharedInformerFactory {
 	return i[namespace]
+}
+
+func (i routeInformersForNamespaces) InformersForOrGlobal(namespace string) routeinformers.SharedInformerFactory {
+	informer, ok := i[namespace]
+	if !ok {
+		return i[metav1.NamespaceAll]
+	}
+	return informer
 }
 
 func (i routeInformersForNamespaces) HasInformersFor(namespace string) bool {

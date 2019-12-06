@@ -322,8 +322,8 @@ var _ = g.Describe("Routes", func() {
 				TLS: &routev1.TLSConfig{
 					Termination:                   routev1.TLSTerminationEdge,
 					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyAllow,
-					Key:         string(certData.Key),
-					Certificate: string(certData.Crt),
+					Key:                           string(certData.Key),
+					Certificate:                   string(certData.Crt),
 				},
 			},
 		}
@@ -410,8 +410,8 @@ var _ = g.Describe("Routes", func() {
 				TLS: &routev1.TLSConfig{
 					Termination:                   routev1.TLSTerminationEdge,
 					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyAllow,
-					Key:         string(certData.Key),
-					Certificate: string(certData.Crt),
+					Key:                           string(certData.Key),
+					Certificate:                   string(certData.Crt),
 				},
 			},
 		}

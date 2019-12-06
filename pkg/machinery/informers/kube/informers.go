@@ -1,6 +1,7 @@
 package kube
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 )
@@ -8,6 +9,7 @@ import (
 type Interface interface {
 	Start(stopCh <-chan struct{})
 	InformersFor(namespace string) informers.SharedInformerFactory
+	InformersForOrGlobal(namespace string) informers.SharedInformerFactory
 	Namespaces() []string
 }
 
@@ -33,13 +35,22 @@ func (i kubeInformersForNamespaces) Start(stopCh <-chan struct{}) {
 
 func (i kubeInformersForNamespaces) Namespaces() []string {
 	var ns []string
-	for n, _ := range i {
+	for n := range i {
 		ns = append(ns, n)
 	}
 	return ns
 }
+
 func (i kubeInformersForNamespaces) InformersFor(namespace string) informers.SharedInformerFactory {
 	return i[namespace]
+}
+
+func (i kubeInformersForNamespaces) InformersForOrGlobal(namespace string) informers.SharedInformerFactory {
+	informer, ok := i[namespace]
+	if !ok {
+		return i[metav1.NamespaceAll]
+	}
+	return informer
 }
 
 func (i kubeInformersForNamespaces) HasInformersFor(namespace string) bool {

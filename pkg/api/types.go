@@ -7,9 +7,42 @@ import (
 const (
 	TlsAcmeAnnotation = "kubernetes.io/tls-acme"
 
-	AcmeStatusAnnotation = "acme.openshift.io/status"
-	AcmeTemporaryLabel   = "acme.openshift.io/temporary"
+	AcmeStatusAnnotation   = "acme.openshift.io/status"
+	AcmePriorityAnnotation = "acme.openshift.io/priority"
+	AcmeTemporaryLabel     = "acme.openshift.io/temporary"
+	AcmeExposerId          = "acme.openshift.io/exposer-id"
 )
+
+type CertIssuerType string
+
+const (
+	CertIssuerDataKey                 = "types.acme.openshift.io/cert-issuer"
+	CertIssuerTypeAcme CertIssuerType = "ACME"
+)
+
+type AcmeAccountStatus struct {
+	Hash          string
+	URI           string
+	AccountStatus string
+	OrdersURL     string
+}
+type AcmeAccount struct {
+	Contacts []string
+
+	Status AcmeAccountStatus
+}
+
+type AcmeCertIssuer struct {
+	AccountCredentialsSecretName string
+	DirectoryUrl                 string
+	Account                      AcmeAccount
+}
+
+type CertIssuer struct {
+	Type CertIssuerType
+
+	AcmeCertIssuer *AcmeCertIssuer
+}
 
 type CertificateMeta struct {
 	//

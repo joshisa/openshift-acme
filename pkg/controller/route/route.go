@@ -12,17 +12,17 @@ import (
 	"math/rand"
 	"net/http"
 	"reflect"
+	"sort"
+	"strconv"
 	"time"
 
 	"golang.org/x/crypto/acme"
-	"k8s.io/client-go/util/retry"
+	"gopkg.in/yaml.v2"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	kapierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -36,10 +36,9 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
 	_ "github.com/openshift/client-go/route/clientset/versioned/scheme"
-	acmeclient "github.com/tnozicka/openshift-acme/pkg/acme/client"
-	acmeclientbuilder "github.com/tnozicka/openshift-acme/pkg/acme/client/builder"
 	"github.com/tnozicka/openshift-acme/pkg/api"
 	"github.com/tnozicka/openshift-acme/pkg/cert"
+	"github.com/tnozicka/openshift-acme/pkg/helpers"
 	kubeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/kube"
 	routeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/route"
 	routeutil "github.com/tnozicka/openshift-acme/pkg/route"
@@ -48,7 +47,8 @@ import (
 
 const (
 	ControllerName = "openshift-acme-controller"
-	// Raise this when we have separate rate limiting for ACME.
+	ExposerFileKey = "exposer-file"
+	// Remove this when we have separate rate limiting for ACME.
 	// Now it will get eventually reconciled when informers re-sync or on edit.
 	MaxRetries               = 2
 	RenewalStandardDeviation = 1
@@ -63,11 +63,14 @@ var (
 )
 
 type RouteController struct {
-	acmeClientFactory *acmeclientbuilder.SharedClientFactory
-	orderTimeout      time.Duration
+	orderTimeout time.Duration
+	exposerImage string
 
 	kubeClient                 kubernetes.Interface
 	kubeInformersForNamespaces kubeinformers.Interface
+
+	// appsClient                 kubernetes.Interface
+	// appsInformersForNamespaces kubeinformers.Interface
 
 	routeClient                 routeclientset.Interface
 	routeInformersForNamespaces routeinformers.Interface
@@ -80,8 +83,8 @@ type RouteController struct {
 }
 
 func NewRouteController(
-	acmeClientFactory *acmeclientbuilder.SharedClientFactory,
 	orderTimeout time.Duration,
+	exposerImage string,
 	kubeClient kubernetes.Interface,
 	kubeInformersForNamespaces kubeinformers.Interface,
 	routeClient routeclientset.Interface,
@@ -92,7 +95,8 @@ func NewRouteController(
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 
 	rc := &RouteController{
-		acmeClientFactory: acmeClientFactory,
+		orderTimeout: orderTimeout,
+		exposerImage: exposerImage,
 
 		kubeClient:                 kubeClient,
 		kubeInformersForNamespaces: kubeInformersForNamespaces,
@@ -132,7 +136,7 @@ func NewRouteController(
 func (rc *RouteController) enqueueRoute(route *routev1.Route) {
 	key, err := KeyFunc(route)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %#v: %v", route, err))
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for route object: %w", err))
 		return
 	}
 
@@ -249,7 +253,7 @@ func (rc *RouteController) resolveControllerRef(namespace string, controllerRef 
 		return nil
 	}
 
-	route, err := rc.routeInformersForNamespaces.InformersFor(namespace).Route().V1().Routes().Lister().Routes(namespace).Get(controllerRef.Name)
+	route, err := rc.routeInformersForNamespaces.InformersForOrGlobal(namespace).Route().V1().Routes().Lister().Routes(namespace).Get(controllerRef.Name)
 	if err != nil {
 		return nil
 	}
@@ -367,19 +371,18 @@ func (rc *RouteController) updateStatus(route *routev1.Route, status *api.Status
 // The retry logic should not be part of the business logic.
 // This function is not meant to be invoked concurrently with the same key.
 func (rc *RouteController) handle(key string) error {
-	startTime := time.Now()
-	klog.V(4).Infof("Started syncing Route %q (%v)", key, startTime)
+	klog.V(4).Infof("Started syncing Route %q", key)
 	defer func() {
-		klog.V(4).Infof("Finished syncing Route %q (%v)", key, time.Since(startTime))
+		klog.V(4).Infof("Finished syncing Route %q", key)
 	}()
 
 	namespace, _, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return err
 	}
 
-	objReadOnly, exists, err := rc.routeInformersForNamespaces.InformersFor(namespace).Route().V1().Routes().Informer().GetIndexer().GetByKey(key)
+	objReadOnly, exists, err := rc.routeInformersForNamespaces.InformersForOrGlobal(namespace).Route().V1().Routes().Informer().GetIndexer().GetByKey(key)
 	if err != nil {
 		klog.Errorf("Fetching object with key %s from store failed with %v", key, err)
 		return err
@@ -406,9 +409,93 @@ func (rc *RouteController) handle(key string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), AcmeTimeout)
 	defer cancel()
 
-	client, err := rc.acmeClientFactory.GetClient(ctx)
+	issuerConfigMaps, err := rc.kubeInformersForNamespaces.InformersForOrGlobal(routeReadOnly.Namespace).Core().V1().ConfigMaps().Lister().ConfigMaps(routeReadOnly.Namespace).List(api.AccountLabelSet.AsSelector())
 	if err != nil {
-		return fmt.Errorf("failed to get ACME client: %v", err)
+		return err
+	}
+
+	if len(issuerConfigMaps) < 1 {
+		return fmt.Errorf("can't find any issuer")
+	}
+
+	// TODO: Filter out non-matching issuers and solvers
+
+	if len(issuerConfigMaps) < 1 {
+		return fmt.Errorf("no issuer matched the requirements")
+	}
+
+	sort.Slice(issuerConfigMaps, func(i, j int) bool {
+		lhs := issuerConfigMaps[i]
+		rhs := issuerConfigMaps[i]
+
+		lhsPrio := 0
+		lhsPrioString, ok := lhs.Annotations[api.AcmePriorityAnnotation]
+		if ok && len(lhsPrioString) != 0 {
+			v, err := strconv.Atoi(lhsPrioString)
+			if err == nil {
+				lhsPrio = v
+			} else {
+				klog.Warning(err)
+			}
+		}
+
+		rhsPrio := 0
+		rhsPrioString, ok := rhs.Annotations[api.AcmePriorityAnnotation]
+		if ok && len(rhsPrioString) != 0 {
+			v, err := strconv.Atoi(rhsPrioString)
+			if err == nil {
+				rhsPrio = v
+			} else {
+				klog.Warning(err)
+			}
+		}
+
+		if lhsPrio < rhsPrio {
+			return true
+		}
+
+		if lhs.CreationTimestamp.Time.After(rhs.CreationTimestamp.Time) {
+			return true
+		}
+
+		return false
+	})
+
+	certIssuerCM := issuerConfigMaps[0]
+
+	certIssuerData, ok := certIssuerCM.Data[api.CertIssuerDataKey]
+	if !ok {
+		return fmt.Errorf("configmap %s is matching CertIssuer selectors %q but missing key %q", key, api.AccountLabelSet, api.CertIssuerDataKey)
+	}
+
+	certIssuer := &api.CertIssuer{}
+	err = yaml.Unmarshal([]byte(certIssuerData), certIssuer)
+	if err != nil {
+		return fmt.Errorf("configmap %s is matching CertIssuer selectors %q but contains invalid object: %w", key, api.AccountLabelSet, err)
+	}
+
+	switch certIssuer.Type {
+	case api.CertIssuerTypeAcme:
+		break
+	default:
+		return fmt.Errorf("unsupported cert issuer type %q", certIssuer.Type)
+	}
+
+	acmeIssuer := certIssuer.AcmeCertIssuer
+
+	secret, err := rc.kubeInformersForNamespaces.InformersForOrGlobal(certIssuerCM.Namespace).Core().V1().Secrets().Lister().Secrets(certIssuerCM.Namespace).Get(acmeIssuer.AccountCredentialsSecretName)
+	if err != nil {
+		return err
+	}
+
+	acmeClient := &acme.Client{
+		DirectoryURL: acmeIssuer.DirectoryUrl,
+		UserAgent:    "github.com/tnozicka/openshift-acme",
+	}
+
+	acmeClient.Key, err = helpers.PrivateKeyFromSecret(secret)
+	if err != nil {
+		return err
 	}
 
 	status, err := rc.getStatus(routeReadOnly)
@@ -434,7 +521,7 @@ func (rc *RouteController) handle(key string) error {
 	domain := routeReadOnly.Spec.Host
 
 	if status.ProvisioningStatus == nil || len(status.ProvisioningStatus.OrderUri) == 0 {
-		order, err := client.Client.AuthorizeOrder(ctx, acme.DomainIDs(domain))
+		order, err := acmeClient.AuthorizeOrder(ctx, acme.DomainIDs(domain))
 		if err != nil {
 			return err
 		}
@@ -454,7 +541,7 @@ func (rc *RouteController) handle(key string) error {
 		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 	}
 
-	order, err := client.Client.GetOrder(ctx, status.ProvisioningStatus.OrderUri)
+	order, err := acmeClient.GetOrder(ctx, status.ProvisioningStatus.OrderUri)
 	if err != nil {
 		acmeErr, ok := err.(*acme.Error)
 		if !ok || acmeErr.StatusCode != http.StatusNotFound {
@@ -477,7 +564,7 @@ func (rc *RouteController) handle(key string) error {
 		klog.V(4).Infof("Route %q: Order %q contains %d authorization(s)", key, order.URI, len(order.AuthzURLs))
 
 		for _, authzUrl := range order.AuthzURLs {
-			authz, err := client.Client.GetAuthorization(ctx, authzUrl)
+			authz, err := acmeClient.GetAuthorization(ctx, authzUrl)
 			if err != nil {
 				return err
 			}
@@ -513,7 +600,14 @@ func (rc *RouteController) handle(key string) error {
 
 			switch challenge.Status {
 			case acme.StatusPending:
-				tmpName := getTemporaryName(routeReadOnly.Name + ":" + order.URI + ":" + authzUrl + ":" + challenge.URI)
+				id := routeReadOnly.Name + ":" + order.URI + ":" + authzUrl + ":" + challenge.URI
+				tmpName := getTemporaryName(id)
+
+				challengePath := acmeClient.HTTP01ChallengePath(challenge.Token)
+				challengeResponse, err := acmeClient.HTTP01ChallengeResponse(challenge.Token)
+				if err != nil {
+					return err
+				}
 
 				/*
 				 * Route
@@ -531,43 +625,40 @@ func (rc *RouteController) handle(key string) error {
 						Controller: &trueVal,
 					},
 				}
+				if desiredExposerRoute.Annotations == nil {
+					desiredExposerRoute.Annotations = map[string]string{}
+				}
+				desiredExposerRoute.Annotations[api.AcmeExposerId] = id
 				if desiredExposerRoute.Labels == nil {
 					desiredExposerRoute.Labels = map[string]string{}
 				}
 				desiredExposerRoute.Labels[api.AcmeTemporaryLabel] = "true"
-				desiredExposerRoute.Spec.Path = client.Client.HTTP01ChallengePath(challenge.Token)
+				desiredExposerRoute.Spec.Path = acmeClient.HTTP01ChallengePath(challenge.Token)
 				desiredExposerRoute.Spec.To = routev1.RouteTargetReference{
 					Kind: "Service",
 					Name: tmpName,
 				}
 
-				exposerRoute, err := rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Create(desiredExposerRoute)
+				exposerRoute, err := rc.routeInformersForNamespaces.InformersForOrGlobal(routeReadOnly.Namespace).Route().V1().Routes().Lister().Routes(routeReadOnly.Namespace).Get(desiredExposerRoute.Name)
 				if err != nil {
-					if kapierrors.IsAlreadyExists(err) {
-						err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-							exposerRoute, err = rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Get(desiredExposerRoute.Name, metav1.GetOptions{})
-							if err != nil {
-								return err
-							}
-
-							if !metav1.IsControlledBy(exposerRoute, routeReadOnly) {
-								return fmt.Errorf("exposer Route %s/%s already exists and isn't owned by route %s", exposerRoute.Namespace, exposerRoute.Name, key)
-							}
-
-							// Replace whatever is there
-							desiredExposerRoute.ResourceVersion = exposerRoute.ResourceVersion
-							exposerRoute, err = rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Update(desiredExposerRoute)
-							if err != nil {
-								return err
-							}
-							return nil
-						})
+					if kapierrors.IsNotFound(err) {
+						exposerRoute, err = rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Create(desiredExposerRoute)
 						if err != nil {
 							return err
 						}
-					} else {
-						return err
 					}
+				}
+
+				if !metav1.IsControlledBy(exposerRoute, routeReadOnly) {
+					return fmt.Errorf("exposer Route %s/%s already exists and isn't owned by route %s", exposerRoute.Namespace, exposerRoute.Name, key)
+				}
+
+				// Check the id to avoid collisions
+				exposerRouteId, ok := desiredExposerRoute.Annotations[api.AcmeExposerId]
+				if !ok {
+					return fmt.Errorf("exposer route %s/%s misses exposer id", exposerRoute.Namespace, exposerRoute.Name)
+				} else if exposerRouteId != id {
+					return fmt.Errorf("exposer route %s/%s id missmatch: expected %q, got %q", exposerRoute.Namespace, exposerRoute.Name, id, exposerRouteId)
 				}
 
 				ownerRefToExposerRoute := metav1.OwnerReference{
@@ -575,6 +666,46 @@ func (rc *RouteController) handle(key string) error {
 					Kind:       "Route",
 					Name:       exposerRoute.Name,
 					UID:        exposerRoute.UID,
+				}
+
+				/*
+				 * Secret
+				 */
+				desiredExposerSecret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            tmpName,
+						OwnerReferences: []metav1.OwnerReference{ownerRefToExposerRoute},
+						Annotations: map[string]string{
+							api.AcmeExposerId: id,
+						},
+						Labels: map[string]string{
+							api.AcmeTemporaryLabel: "true",
+						},
+					},
+					StringData: map[string]string{
+						ExposerFileKey: challengePath + "" + challengeResponse,
+					},
+				}
+				exposerSecret, err := rc.kubeInformersForNamespaces.InformersForOrGlobal(routeReadOnly.Namespace).Core().V1().Secrets().Lister().Secrets(routeReadOnly.Namespace).Get(desiredExposerSecret.Name)
+				if err != nil {
+					if kapierrors.IsNotFound(err) {
+						exposerSecret, err = rc.kubeClient.CoreV1().Secrets(routeReadOnly.Namespace).Create(desiredExposerSecret)
+						if err != nil {
+							return err
+						}
+					}
+				}
+
+				if !metav1.IsControlledBy(exposerSecret, routeReadOnly) {
+					return fmt.Errorf("secret %s/%s already exists and isn't owned by route %s", exposerSecret.Namespace, exposerSecret.Name, key)
+				}
+
+				// Check the id to avoid collisions
+				exposerSecretId, ok := desiredExposerRoute.Annotations[api.AcmeExposerId]
+				if !ok {
+					return fmt.Errorf("exposer secret %s/%s misses exposer id", exposerRoute.Namespace, exposerRoute.Name)
+				} else if exposerSecretId != id {
+					return fmt.Errorf("exposer secret %s/%s id missmatch: expected %q, got %q", exposerRoute.Namespace, exposerRoute.Name, id, exposerSecretId)
 				}
 
 				/*
@@ -591,6 +722,9 @@ func (rc *RouteController) handle(key string) error {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:            tmpName,
 						OwnerReferences: []metav1.OwnerReference{ownerRefToExposerRoute},
+						Annotations: map[string]string{
+							api.AcmeExposerId: id,
+						},
 						Labels: map[string]string{
 							api.AcmeTemporaryLabel: "true",
 						},
@@ -602,37 +736,60 @@ func (rc *RouteController) handle(key string) error {
 							ObjectMeta: metav1.ObjectMeta{
 								Labels: podLabels,
 							},
-							Spec: corev1.PodSpec{},
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{
+										Name:  "exposer",
+										Image: rc.exposerImage,
+										Command: []string{
+											"openshift-acme-exposer",
+										},
+										Args: []string{
+											"--response-file=/etc/openshift-acme-exposer/response-file",
+										},
+										VolumeMounts: []corev1.VolumeMount{
+											{
+												Name:      "exposerData",
+												ReadOnly:  true,
+												MountPath: "/etc/openshift-acme-exposer/response-file",
+											},
+										},
+									},
+								},
+								Volumes: []corev1.Volume{
+									{
+										Name: "exposerData",
+										VolumeSource: corev1.VolumeSource{
+											Secret: &corev1.SecretVolumeSource{
+												SecretName: exposerSecret.Name,
+											},
+										},
+									},
+								},
+							},
 						},
 					},
 				}
-				exposerRS, err := rc.kubeClient.AppsV1().ReplicaSets(routeReadOnly.Namespace).Create(desiredExposerRS)
+				exposerRS, err := rc.kubeInformersForNamespaces.InformersForOrGlobal(routeReadOnly.Namespace).Apps().V1().ReplicaSets().Lister().ReplicaSets(routeReadOnly.Namespace).Get(desiredExposerRS.Name)
 				if err != nil {
-					if kapierrors.IsAlreadyExists(err) {
-						err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-							exposerRS, err = rc.kubeClient.AppsV1().ReplicaSets(routeReadOnly.Namespace).Get(desiredExposerRS.Name, metav1.GetOptions{})
-							if err != nil {
-								return err
-							}
-
-							if !metav1.IsControlledBy(exposerRS, routeReadOnly) {
-								return fmt.Errorf("pod %s/%s already exists and isn't owned by route %s", exposerRS.Namespace, exposerRS.Name, key)
-							}
-
-							// Replace whatever is there
-							desiredExposerRS.ResourceVersion = exposerRS.ResourceVersion
-							exposerRS, err = rc.kubeClient.AppsV1().ReplicaSets(routeReadOnly.Namespace).Update(desiredExposerRS)
-							if err != nil {
-								return err
-							}
-							return nil
-						})
+					if kapierrors.IsNotFound(err) {
+						exposerRS, err = rc.kubeClient.AppsV1().ReplicaSets(routeReadOnly.Namespace).Create(desiredExposerRS)
 						if err != nil {
 							return err
 						}
-					} else {
-						return err
 					}
+				}
+
+				if !metav1.IsControlledBy(exposerRS, routeReadOnly) {
+					return fmt.Errorf("RS %s/%s already exists and isn't owned by route %s", exposerRS.Namespace, exposerRS.Name, key)
+				}
+
+				// Check the id to avoid collisions
+				exposerRSId, ok := desiredExposerRoute.Annotations[api.AcmeExposerId]
+				if !ok {
+					return fmt.Errorf("exposer RS %s/%s misses exposer id", exposerRoute.Namespace, exposerRoute.Name)
+				} else if exposerRSId != id {
+					return fmt.Errorf("exposer RS %s/%s id missmatch: expected %q, got %q", exposerRoute.Namespace, exposerRoute.Name, id, exposerRSId)
 				}
 
 				/*
@@ -642,6 +799,9 @@ func (rc *RouteController) handle(key string) error {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:            tmpName,
 						OwnerReferences: []metav1.OwnerReference{ownerRefToExposerRoute},
+						Annotations: map[string]string{
+							api.AcmeExposerId: id,
+						},
 						Labels: map[string]string{
 							api.AcmeTemporaryLabel: "true",
 						},
@@ -651,33 +811,26 @@ func (rc *RouteController) handle(key string) error {
 						Type:     corev1.ServiceTypeClusterIP,
 					},
 				}
-				exposerService, err := rc.kubeClient.CoreV1().Services(routeReadOnly.Namespace).Create(desiredExposerService)
+				exposerService, err := rc.kubeInformersForNamespaces.InformersForOrGlobal(routeReadOnly.Namespace).Core().V1().Services().Lister().Services(routeReadOnly.Namespace).Get(desiredExposerService.Name)
 				if err != nil {
-					if kapierrors.IsAlreadyExists(err) {
-						err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-							exposerService, err = rc.kubeClient.CoreV1().Services(routeReadOnly.Namespace).Get(desiredExposerService.Name, metav1.GetOptions{})
-							if err != nil {
-								return err
-							}
-
-							if !metav1.IsControlledBy(exposerService, routeReadOnly) {
-								return fmt.Errorf("pod %s/%s already exists and isn't owned by route %s", exposerService.Namespace, exposerService.Name, key)
-							}
-
-							// Replace whatever is there
-							desiredExposerService.ResourceVersion = exposerService.ResourceVersion
-							exposerService, err = rc.kubeClient.CoreV1().Services(routeReadOnly.Namespace).Update(desiredExposerService)
-							if err != nil {
-								return err
-							}
-							return nil
-						})
+					if kapierrors.IsNotFound(err) {
+						exposerService, err = rc.kubeClient.CoreV1().Services(routeReadOnly.Namespace).Create(desiredExposerService)
 						if err != nil {
 							return err
 						}
-					} else {
-						return err
 					}
+				}
+
+				if !metav1.IsControlledBy(exposerService, routeReadOnly) {
+					return fmt.Errorf("service %s/%s already exists and isn't owned by route %s", exposerService.Namespace, exposerService.Name, key)
+				}
+
+				// Check the id to avoid collisions
+				exposerServiceId, ok := desiredExposerRoute.Annotations[api.AcmeExposerId]
+				if !ok {
+					return fmt.Errorf("exposer service %s/%s misses exposer id", exposerRoute.Namespace, exposerRoute.Name)
+				} else if exposerServiceId != id {
+					return fmt.Errorf("exposer service %s/%s id missmatch: expected %q, got %q", exposerRoute.Namespace, exposerRoute.Name, id, exposerServiceId)
 				}
 
 				// TODO: wait for pods to run and report into status, requeue
@@ -685,7 +838,7 @@ func (rc *RouteController) handle(key string) error {
 				// so on happy path there shouldn't be issues. But pods can get stuck
 				// on scheduling, quota, resources, ... and we want to know why the validation fails.
 
-				_, err = client.Client.Accept(ctx, challenge)
+				_, err = acmeClient.Accept(ctx, challenge)
 				if err != nil {
 					return err
 				}
@@ -693,7 +846,7 @@ func (rc *RouteController) handle(key string) error {
 			case acme.StatusProcessing, acme.StatusValid, acme.StatusInvalid:
 				// These states will manifest into global order state over time.
 				// We only need to attend to pending states.
-				// We could possibly report events for those but is seems too fine grained now.
+				// We could possibly report events for those but is seems too fine grained for now.
 				continue
 
 			default:
@@ -729,7 +882,7 @@ func (rc *RouteController) handle(key string) error {
 		// Send CSR
 		// FIXME: Unfortunately golang also waits in this method for the cert creation
 		//  although that should be asynchronous. Requires fixing golang lib. (The helpers used are private.)
-		der, certUrl, err := client.Client.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
+		der, certUrl, err := acmeClient.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
 		if err != nil {
 			return err
 		}
@@ -770,7 +923,13 @@ func (rc *RouteController) handle(key string) error {
 		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 
 	case acme.StatusInvalid:
-		rc.recorder.Eventf(routeReadOnly, corev1.EventTypeWarning, "AcmeFailedAuthorization", "Acme provider failed to validate domain %q: %s", routeReadOnly.Spec.Host, acmeclient.GetAuthorizationErrors(authorization))
+		var err error
+		if order.Error != nil {
+			err = order.Error
+		} else {
+			err = fmt.Errorf("order is missing an error")
+		}
+		rc.recorder.Eventf(routeReadOnly, corev1.EventTypeWarning, "AcmeFailedOrder", "Order %q for domain %q failed: %v", routeReadOnly.Spec.Host, err)
 
 		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 
@@ -779,12 +938,14 @@ func (rc *RouteController) handle(key string) error {
 	}
 }
 
+// FIXME: move to its own sync loop
+/*
 func (rc *RouteController) syncSecret(routeReadOnly *routev1.Route) error {
 	// TODO: consider option of choosing a oldSecret name using an annotation
 	secretName := routeReadOnly.Name
 
 	secretExists := true
-	oldSecret, err := rc.kubeInformersForNamespaces.InformersFor(routeReadOnly.Namespace).Core().V1().Secrets().Lister().Secrets(routeReadOnly.Namespace).Get(secretName)
+	oldSecret, err := rc.kubeInformersForNamespaces.InformersForOrGlobal(routeReadOnly.Namespace).Core().V1().Secrets().Lister().Secrets(routeReadOnly.Namespace).Get(secretName)
 	if err != nil {
 		if !kapierrors.IsNotFound(err) {
 			return fmt.Errorf("failed to get Secret %s/%s: %v", routeReadOnly.Namespace, secretName, err)
@@ -874,6 +1035,7 @@ func (rc *RouteController) syncSecret(routeReadOnly *routev1.Route) error {
 
 	return nil
 }
+*/
 
 // handleErr checks if an error happened and makes sure we will retry later.
 func (rc *RouteController) handleErr(err error, key interface{}) {
@@ -896,7 +1058,7 @@ func (rc *RouteController) handleErr(err error, key interface{}) {
 
 	rc.queue.Forget(key)
 	// Report to an external entity that, even after several retries, we could not successfully process this key
-	runtime.HandleError(err)
+	utilruntime.HandleError(err)
 	klog.Infof("Dropping Route %q out of the queue: %v", key, err)
 }
 
@@ -924,7 +1086,7 @@ func (rc *RouteController) runWorker() {
 }
 
 func (rc *RouteController) Run(workers int, stopCh <-chan struct{}) {
-	defer runtime.HandleCrash()
+	defer utilruntime.HandleCrash()
 
 	// Let the workers stop when we are done
 	defer rc.queue.ShutDown()
@@ -934,7 +1096,7 @@ func (rc *RouteController) Run(workers int, stopCh <-chan struct{}) {
 
 	// Wait for all involved caches to be synced, before processing items from the queue is started
 	if !cache.WaitForCacheSync(stopCh, rc.cachesToSync...) {
-		runtime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
+		utilruntime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
 		return
 	}
 

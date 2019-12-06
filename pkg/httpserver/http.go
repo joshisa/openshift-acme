@@ -20,7 +20,12 @@ type Server struct {
 func (h *Server) handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 
-	uri := strings.Split(r.Host, ":")[0] + r.URL.String()
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		klog.Error(err)
+		host = r.Host
+	}
+	uri := host + r.URL.String()
 	response, found := h.UriToResponse[uri]
 	klog.V(4).Infof("URI %q %sfound", uri, func() string {
 		if !found {
