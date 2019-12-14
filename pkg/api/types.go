@@ -16,32 +16,32 @@ const (
 type CertIssuerType string
 
 const (
-	CertIssuerDataKey                 = "types.acme.openshift.io/cert-issuer"
+	CertIssuerDataKey                 = "cert-issuer.types.acme.openshift.io"
 	CertIssuerTypeAcme CertIssuerType = "ACME"
 )
 
 type AcmeAccountStatus struct {
-	Hash          string
-	URI           string
-	AccountStatus string
-	OrdersURL     string
+	Hash          string `json:"hash"`
+	URI           string `json:"uri"`
+	AccountStatus string `json:"accountStatus"`
+	OrdersURL     string `json:"ordersURL"`
 }
 type AcmeAccount struct {
-	Contacts []string
+	Contacts []string `json:"contacts"`
 
-	Status AcmeAccountStatus
+	Status AcmeAccountStatus ` json:"status"`
 }
 
 type AcmeCertIssuer struct {
-	AccountCredentialsSecretName string
-	DirectoryUrl                 string
-	Account                      AcmeAccount
+	AccountCredentialsSecretName string      `json:"accountCredentialsSecretName"`
+	DirectoryUrl                 string      `json:"directoryUrl"`
+	Account                      AcmeAccount `json:"account"`
 }
 
 type CertIssuer struct {
-	Type CertIssuerType
+	Type CertIssuerType `json:"type"`
 
-	AcmeCertIssuer *AcmeCertIssuer
+	AcmeCertIssuer *AcmeCertIssuer `json:"acmeCertIssuer"`
 }
 
 type CertificateMeta struct {

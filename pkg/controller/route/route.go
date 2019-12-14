@@ -50,7 +50,7 @@ const (
 	ExposerFileKey = "exposer-file"
 	// Remove this when we have separate rate limiting for ACME.
 	// Now it will get eventually reconciled when informers re-sync or on edit.
-	MaxRetries               = 2
+	MaxRetries               = 50 // 2
 	RenewalStandardDeviation = 1
 	RenewalMean              = 0
 	AcmeTimeout              = 60 * time.Second

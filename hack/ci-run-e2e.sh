@@ -11,7 +11,6 @@ case $1 in
     exit 1
 esac
 
-
 function teardown {
     if [ -n "${ARTIFACT_DIR}" ]; then
         oc logs -n "${PROJECT}" deploy/openshift-acme > "${ARTIFACT_DIR}"/openshift-acme_deploy.log || true
@@ -64,8 +63,10 @@ case $1 in
     exit 1
 esac
 
-oc tag -d openshift-acme:latest
-oc tag registry.svc.ci.openshift.org/"${OPENSHIFT_BUILD_NAMESPACE}"/pipeline:openshift-acme openshift-acme:latest
+oc tag -d openshift-acme:controller
+oc tag -d openshift-acme:exposer
+oc tag registry.svc.ci.openshift.org/"${OPENSHIFT_BUILD_NAMESPACE}"/pipeline:openshift-acme-controller openshift-acme:controller
+oc tag registry.svc.ci.openshift.org/"${OPENSHIFT_BUILD_NAMESPACE}"/pipeline:openshift-acme-exposer openshift-acme:exposer
 
 case $1 in
 "cluster-wide")

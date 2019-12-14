@@ -118,9 +118,9 @@ func NewOpenshiftAcmeControllerCommand(streams genericclioptions.IOStreams) *cob
 	rootCmd.PersistentFlags().StringVarP(&o.ControllerNamespace, "controller-namespace", "", o.ControllerNamespace, "Namespace where the controller is running. Autodetected if run inside a cluster.")
 	rootCmd.PersistentFlags().StringArrayVarP(&o.Namespaces, "namespace", "n", o.Namespaces, "Restricts controller to namespace(s). If not specified controller watches all namespaces.")
 
-	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionLeaseDuration, "leaderelection-lease-duration", "LeaseDuration is the duration that non-leader candidates will wait to force acquire leadership.", o.LeaderelectionLeaseDuration, "")
-	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionRenewDeadline, "leaderelection-renew-deadline", "RenewDeadline is the duration that the acting master will retry refreshing leadership before giving up.", o.LeaderelectionRenewDeadline, "")
-	rootCmd.PersistentFlags().DurationVarP(&o.LeaderelectionRetryPeriod, "leaderelection-retry-period", "RetryPeriod is the duration the LeaderElector clients should wait between tries of actions.", o.LeaderelectionRetryPeriod, "")
+	rootCmd.PersistentFlags().DurationVar(&o.LeaderelectionLeaseDuration, "leaderelection-lease-duration", o.LeaderelectionLeaseDuration, "LeaseDuration is the duration that non-leader candidates will wait to force acquire leadership.")
+	rootCmd.PersistentFlags().DurationVar(&o.LeaderelectionRenewDeadline, "leaderelection-renew-deadline", o.LeaderelectionRenewDeadline, "RenewDeadline is the duration that the acting master will retry refreshing leadership before giving up.")
+	rootCmd.PersistentFlags().DurationVar(&o.LeaderelectionRetryPeriod, "leaderelection-retry-period", o.LeaderelectionRetryPeriod, "RetryPeriod is the duration the LeaderElector clients should wait between tries of actions.")
 
 	rootCmd.PersistentFlags().StringVarP(&o.ExposerImage, "exposer-image", "", o.ExposerImage, "Image to use for exposing tokens for http based validation. (In standard configuration this contains openshift-acme-exposer binary, but the API is generic.)")
 
@@ -133,6 +133,9 @@ func (o *Options) Validate() error {
 	var errs []error
 
 	for _, namespace := range o.Namespaces {
+		if namespace == metav1.NamespaceAll {
+			continue
+		}
 		errStrings := kvalidation.ValidateNamespaceName(namespace, false)
 		if len(errStrings) > 0 {
 			errs = append(errs, fmt.Errorf("invalid namespace %q: %s", namespace, strings.Join(errStrings, ", ")))
@@ -142,13 +145,18 @@ func (o *Options) Validate() error {
 		return errors.NewAggregate(errs)
 	}
 
-	// errStrings := kvalidation.NameIsDNSSubdomain(o.AcmeAccountSecret, false)
-	// if len(errs) > 0 {
-	// 	return fmt.Errorf("acme account secret name is invalid: %s", strings.Join(errStrings, ", "))
-	// }
-
 	if len(o.ExposerImage) == 0 {
-		return fmt.Errorf("exposer image not specified")
+		// Default to env if present
+		ei, ok := os.LookupEnv("OPENSHIFT_ACME_EXPOSER_IMAGE")
+		if !ok {
+			return fmt.Errorf("exposer image not specified")
+		}
+
+		if len(ei) == 0 {
+			return fmt.Errorf("OPENSHIFT_ACME_EXPOSER_IMAGE contains empty string")
+		}
+
+		o.ExposerImage = ei
 	}
 
 	// TODO
@@ -214,8 +222,25 @@ func (o *Options) Complete() error {
 }
 
 func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) error {
+	var leWg sync.WaitGroup
+	var wg sync.WaitGroup
+	leCtx, leCancel := context.WithCancel(context.Background())
+	defer func() {
+		klog.Info("Waiting for controllers to finish...")
+		wg.Wait()
+
+		// Leader election doesn't end gracefully yet, flush just in case
+		klog.Flush()
+
+		klog.Info("Waiting for leaded election loop to finish...")
+		leCancel()
+		leWg.Wait()
+
+		klog.Flush()
+	}()
+
 	stopCh := signals.StopChannel()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(leCtx)
 	go func() {
 		<-stopCh
 		cancel()
@@ -242,18 +267,19 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 		},
 	}
 
-	leChan := make(chan os.Signal, 2)
-
+	leChan := make(chan struct{})
 	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:          lock,
-		LeaseDuration: o.LeaderelectionLeaseDuration,
-		RenewDeadline: o.LeaderelectionRenewDeadline,
-		RetryPeriod:   o.LeaderelectionRetryPeriod,
+		Lock:            lock,
+		LeaseDuration:   o.LeaderelectionLeaseDuration,
+		RenewDeadline:   o.LeaderelectionRenewDeadline,
+		RetryPeriod:     o.LeaderelectionRetryPeriod,
+		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-
+				close(leChan)
 			},
 			OnStoppedLeading: func() {
+				// TODO: handle our termination gracefully but fail we lost it
 				klog.Fatalf("leaderelection lost")
 			},
 		},
@@ -262,7 +288,11 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 	if err != nil {
 		return fmt.Errorf("leaderelection failed: %v")
 	}
-	le.Run(ctx)
+
+	leWg.Add(1)
+	go func() {
+		le.Run(ctx)
+	}()
 
 	select {
 	case <-leChan:
@@ -283,8 +313,6 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 	kubeInformersForNamespaces.Start(stopCh)
 	routeInformersForNamespaces.Start(stopCh)
 
-	var wg sync.WaitGroup
-
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -298,11 +326,6 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 	}()
 
 	<-stopCh
-
-	klog.Info("Waiting for controllers to finish...")
-	wg.Wait()
-
-	klog.Flush()
 
 	return nil
 }

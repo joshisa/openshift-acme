@@ -6,6 +6,10 @@ all: build
 GO_BUILD_PACKAGES :=./cmd/...
 GO_TEST_PACKAGES :=./cmd/... ./pkg/...
 
+IMAGE_REGISTRY :=docker.io
+
+PROJECT?=acme-controller
+
 # we intentionaly don't specify this value because test are making changes to the cluster so we wan't user to configure it explicitely
 GO_ET_KUBECONFIG :="<unspecified>"
 TEST_FLAGS :=
@@ -24,7 +28,8 @@ include $(addprefix ./vendor/github.com/openshift/library-go/alpha-build-machine
 # $2 - Dockerfile path
 # $3 - context directory for image build
 # It will generate target "image-$(1)" for builing the image an binding it as a prerequisite to target "images".
-$(call build-image,openshift-acme-controller,./images/openshift-acme-controller/Dockerfile,.)
+$(call build-image,openshift-acme-controller,$(IMAGE_REGISTRY)/tnozicka/openshift-acme:controller,./images/openshift-acme-controller/Dockerfile,.)
+$(call build-image,openshift-acme-exposer,$(IMAGE_REGISTRY)/tnozicka/openshift-acme:exposer, ./images/openshift-acme-exposer/Dockerfile,.)
 
 
 verify-deploy-files:
@@ -46,3 +51,11 @@ update: update-deploy-files
 test-extended:
 	go test $(GOFLAGS) ./test/e2e/openshift -args $(TEST_FLAGS)
 .PHONY: test-extended
+
+test-e2e-cluster-wide:
+	./hack/ci-run-e2e.sh cluster-wide
+.PHONY: test-e2e-cluster-wide
+
+test-e2e-single-namespace:
+	./hack/ci-run-e2e.sh single-namespace
+.PHONY: test-e2e-single-namespace

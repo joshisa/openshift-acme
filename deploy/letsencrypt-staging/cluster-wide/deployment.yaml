@@ -5,7 +5,6 @@ metadata:
   labels:
     app: openshift-acme
   annotations:
-    image.openshift.io/triggers: '[{"from":{"kind":"ImageStreamTag","name":"openshift-acme:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"openshift-acme\")].image"}]'
 spec:
   selector:
     matchLabels:
@@ -21,16 +20,10 @@ spec:
       serviceAccountName: openshift-acme
       containers:
       - name: openshift-acme
-        image: " "
+        image: "quay.io/tnozicka/openshift-acme:controller"
+        args:
+        - "--loglevel=2"
         imagePullPolicy: Always
-        ports:
-        - containerPort: 5000
         env:
-        - name: OPENSHIFT_ACME_EXPOSER_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
-        - name: OPENSHIFT_ACME_ACMEURL
-          value: "https://acme-staging.api.letsencrypt.org/directory"
-        - name: OPENSHIFT_ACME_LOGLEVEL
-          value: "4"
+        - name: OPENSHIFT_ACME_EXPOSER_IMAGE
+          value: "quay.io/tnozicka/openshift-acme:exposer"
