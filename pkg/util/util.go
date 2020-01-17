@@ -18,12 +18,18 @@ import (
 )
 
 func IsManaged(obj metav1.Object) bool {
-	annotation, ok := obj.GetAnnotations()[api.TlsAcmeAnnotation]
-	if !ok {
+	v, ok := obj.GetAnnotations()[api.TlsAcmeAnnotation]
+	if !ok || v != "true" {
 		return false
 	}
 
-	return annotation == "true"
+	// ignore temporary routes that inherit the TlsAcmeAnnotation from the real route
+	v, ok = obj.GetLabels()[api.AcmeTemporaryLabel]
+	if ok && v == "true" {
+		return false
+	}
+
+	return true
 }
 
 func CertificateFromPEM(crt []byte) (*x509.Certificate, error) {

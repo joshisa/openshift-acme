@@ -8,7 +8,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base32"
-	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -19,8 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ghodss/yaml"
 	"golang.org/x/crypto/acme"
-	"gopkg.in/yaml.v2"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -112,7 +111,13 @@ func NewRouteController(
 		queue: workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
 	}
 
+	if len(routeInformersForNamespaces.Namespaces()) < 1 {
+		panic("no namespace set up")
+	}
+
 	for _, namespace := range routeInformersForNamespaces.Namespaces() {
+		klog.V(4).Infof("Setting up route informers for namespace %q", namespace)
+
 		informers := routeInformersForNamespaces.InformersFor(namespace)
 
 		informers.Route().V1().Routes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -123,7 +128,13 @@ func NewRouteController(
 		rc.cachesToSync = append(rc.cachesToSync, informers.Route().V1().Routes().Informer().HasSynced)
 	}
 
+	if len(kubeInformersForNamespaces.Namespaces()) < 1 {
+		panic("no namespace set up")
+	}
+
 	for _, namespace := range kubeInformersForNamespaces.Namespaces() {
+		klog.V(4).Infof("Setting up kube informers for namespace %q", namespace)
+
 		informers := kubeInformersForNamespaces.InformersFor(namespace)
 
 		informers.Core().V1().Secrets().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -153,7 +164,7 @@ func (rc *RouteController) addRoute(obj interface{}) {
 		return
 	}
 
-	klog.V(4).Infof("Adding Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
+	klog.V(4).Infof("Adding Route %s/%s UID=%s RV=%s; %#v", route.Namespace, route.Name, route.UID, route.ResourceVersion, route)
 	rc.enqueueRoute(route)
 }
 
@@ -321,7 +332,7 @@ func (rc *RouteController) getStatus(routeReadOnly *routev1.Route) (*api.Status,
 	status := &api.Status{}
 	if routeReadOnly.Annotations != nil {
 		statusString := routeReadOnly.Annotations[api.AcmeStatusAnnotation]
-		err := json.Unmarshal([]byte(statusString), status)
+		err := yaml.Unmarshal([]byte(statusString), status)
 		if err != nil {
 			return nil, fmt.Errorf("can't decode status annotation: %v", err)
 		}
@@ -339,7 +350,7 @@ func (rc *RouteController) setStatus(route *routev1.Route, status *api.Status) e
 
 	// TODO: sign the status
 
-	bytes, err := json.Marshal(status)
+	bytes, err := yaml.Marshal(status)
 	if err != nil {
 		return fmt.Errorf("can't encode status annotation: %v", err)
 	}
@@ -369,11 +380,7 @@ func (rc *RouteController) updateStatus(route *routev1.Route, status *api.Status
 	return nil
 }
 
-// handle is the business logic of the controller.
-// In case an error happened, it has to simply return the error.
-// The retry logic should not be part of the business logic.
-// This function is not meant to be invoked concurrently with the same key.
-func (rc *RouteController) handle(key string) error {
+func (rc *RouteController) sync(ctx context.Context, key string) error {
 	klog.V(4).Infof("Started syncing Route %q", key)
 	defer func() {
 		klog.V(4).Infof("Finished syncing Route %q", key)
@@ -400,6 +407,12 @@ func (rc *RouteController) handle(key string) error {
 
 	// Don't act on objects that are being deleted.
 	if routeReadOnly.DeletionTimestamp != nil {
+		return nil
+	}
+
+	// Although we check when adding the Route into the queue it might have been waiting for a while and edited
+	if !util.IsManaged(routeReadOnly) {
+		klog.V(4).Infof("Skipping Route %s/%s UID=%s RV=%s", routeReadOnly.Namespace, routeReadOnly.Name, routeReadOnly.UID, routeReadOnly.ResourceVersion)
 		return nil
 	}
 
@@ -485,6 +498,9 @@ func (rc *RouteController) handle(key string) error {
 	}
 
 	acmeIssuer := certIssuer.AcmeCertIssuer
+	if acmeIssuer == nil {
+		return fmt.Errorf("ACME issuer is missing AcmeCertIssuer spec")
+	}
 
 	secret, err := rc.kubeInformersForNamespaces.InformersForOrGlobal(certIssuerCM.Namespace).Core().V1().Secrets().Lister().Secrets(certIssuerCM.Namespace).Get(acmeIssuer.AccountCredentialsSecretName)
 	if err != nil {
@@ -523,7 +539,10 @@ func (rc *RouteController) handle(key string) error {
 
 	domain := routeReadOnly.Spec.Host
 
-	if status.ProvisioningStatus == nil || len(status.ProvisioningStatus.OrderUri) == 0 {
+	if status.ProvisioningStatus == nil {
+		status.ProvisioningStatus = &api.CertProvisioningStatus{}
+	}
+	if len(status.ProvisioningStatus.OrderUri) == 0 {
 		order, err := acmeClient.AuthorizeOrder(ctx, acme.DomainIDs(domain))
 		if err != nil {
 			return err
@@ -556,6 +575,8 @@ func (rc *RouteController) handle(key string) error {
 		status.ProvisioningStatus.OrderUri = ""
 		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 	}
+	// TODO: acme or golang should fill in the value
+	order.URI = status.ProvisioningStatus.OrderUri
 
 	status.ProvisioningStatus.OrderStatus = order.Status
 
@@ -605,6 +626,7 @@ func (rc *RouteController) handle(key string) error {
 			case acme.StatusPending:
 				id := routeReadOnly.Name + ":" + order.URI + ":" + authzUrl + ":" + challenge.URI
 				tmpName := getTemporaryName(id)
+				klog.Infof("id: %q, tmpName: %q", id, tmpName)
 
 				challengePath := acmeClient.HTTP01ChallengePath(challenge.Token)
 				challengeResponse, err := acmeClient.HTTP01ChallengeResponse(challenge.Token)
@@ -669,6 +691,7 @@ func (rc *RouteController) handle(key string) error {
 					Kind:       "Route",
 					Name:       exposerRoute.Name,
 					UID:        exposerRoute.UID,
+					Controller: &trueVal,
 				}
 
 				/*
@@ -699,8 +722,8 @@ func (rc *RouteController) handle(key string) error {
 					}
 				}
 
-				if !metav1.IsControlledBy(exposerSecret, routeReadOnly) {
-					return fmt.Errorf("secret %s/%s already exists and isn't owned by route %s", exposerSecret.Namespace, exposerSecret.Name, key)
+				if !metav1.IsControlledBy(exposerSecret, exposerRoute) {
+					return fmt.Errorf("secret %s/%s already exists and isn't owned by expúoser route %s/%s", exposerSecret.Namespace, exposerSecret.Name, exposerRoute.Namespace, exposerRoute.Name)
 				}
 
 				// Check the id to avoid collisions
@@ -783,8 +806,8 @@ func (rc *RouteController) handle(key string) error {
 					}
 				}
 
-				if !metav1.IsControlledBy(exposerRS, routeReadOnly) {
-					return fmt.Errorf("RS %s/%s already exists and isn't owned by route %s", exposerRS.Namespace, exposerRS.Name, key)
+				if !metav1.IsControlledBy(exposerRS, exposerRoute) {
+					return fmt.Errorf("RS %s/%s already exists and isn't owned by exposer route %s/%s", exposerRS.Namespace, exposerRS.Name, exposerRoute.Namespace, exposerRoute.Name)
 				}
 
 				// Check the id to avoid collisions
@@ -1060,12 +1083,13 @@ func (rc *RouteController) handleErr(err error, key interface{}) {
 	}
 
 	rc.queue.Forget(key)
+	rc.queue.AddAfter(key, 24*time.Hour) // Try next day, until we have proper rate limiting for ACME requests
 	// Report to an external entity that, even after several retries, we could not successfully process this key
 	utilruntime.HandleError(err)
 	klog.Infof("Dropping Route %q out of the queue: %v", key, err)
 }
 
-func (rc *RouteController) processNextItem() bool {
+func (rc *RouteController) processNextItem(ctx context.Context) bool {
 	// Wait until there is a new item in the working queue
 	key, quit := rc.queue.Get()
 	if quit {
@@ -1077,45 +1101,44 @@ func (rc *RouteController) processNextItem() bool {
 	defer rc.queue.Done(key)
 
 	// Invoke the method containing the business logic
-	err := rc.handle(key.(string))
+	err := rc.sync(ctx, key.(string))
 	// Handle the error if something went wrong during the execution of the business logic
 	rc.handleErr(err, key)
 	return true
 }
 
-func (rc *RouteController) runWorker() {
-	for rc.processNextItem() {
+func (rc *RouteController) runWorker(ctx context.Context) {
+	for rc.processNextItem(ctx) {
 	}
 }
 
-func (rc *RouteController) Run(workers int, stopCh <-chan struct{}) {
+func (rc *RouteController) Run(ctx context.Context, workers int) {
 	defer utilruntime.HandleCrash()
 
-	// Let the workers stop when we are done
-	defer rc.queue.ShutDown()
-
+	var wg sync.WaitGroup
 	klog.Info("Starting Route controller")
-	defer klog.Info("Shutting down Route controller")
+	defer func() {
+		klog.Info("Shutting down Route controller")
+		rc.queue.ShutDown()
+		wg.Wait()
+		klog.Info("Route controller shut down")
+	}()
 
 	// Wait for all involved caches to be synced, before processing items from the queue is started
-	if !cache.WaitForCacheSync(stopCh, rc.cachesToSync...) {
-		utilruntime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
+	synced := cache.WaitForNamedCacheSync("route controller", ctx.Done(), rc.cachesToSync...)
+	if !synced {
 		return
 	}
 
-	klog.Info("Route controller informer caches synced")
-
-	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			wait.Until(rc.runWorker, time.Second, stopCh)
+			wait.UntilWithContext(ctx, rc.runWorker, time.Second)
 		}()
 	}
-	defer wg.Wait()
 
-	<-stopCh
+	<-ctx.Done()
 }
 
 func getTemporaryName(key string) string {

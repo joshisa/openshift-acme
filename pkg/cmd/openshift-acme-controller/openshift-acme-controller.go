@@ -59,9 +59,9 @@ func NewOptions(streams genericclioptions.IOStreams) *Options {
 		Workers:    10,
 		Kubeconfig: "",
 
-		LeaderelectionLeaseDuration: 15 * time.Second,
-		LeaderelectionRenewDeadline: 10 * time.Second,
-		LeaderelectionRetryPeriod:   2 * time.Second,
+		LeaderelectionLeaseDuration: 60 * time.Second,
+		LeaderelectionRenewDeadline: 35 * time.Second,
+		LeaderelectionRetryPeriod:   10 * time.Second,
 
 		AcmeOrderTimeout: 5 * time.Minute,
 
@@ -216,7 +216,7 @@ func (o *Options) Complete() error {
 		}
 		o.Namespaces = uniqueNamespaces
 	}
-	klog.V(1).Infof("Managing namespaces: %v", o.Namespaces)
+	klog.V(1).Infof("Managing namespaces: %#v", o.Namespaces)
 
 	return nil
 }
@@ -279,8 +279,21 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 				close(leChan)
 			},
 			OnStoppedLeading: func() {
-				// TODO: handle our termination gracefully but fail we lost it
-				klog.Fatalf("leaderelection lost")
+				select {
+				case <-leCtx.Done():
+					// Graceful termination, control loops are already stopped
+					klog.Info("leaderelection lock released")
+
+					// fail safe
+					go func() {
+						time.Sleep(3 * time.Second)
+						klog.Fatalf("Failed to exit in time after releasing leaderelection lock")
+					}()
+
+				default:
+					// Leader election lost
+					klog.Fatalf("leaderelection lost")
+				}
 			},
 		},
 		Name: "openshift-acme",
@@ -291,14 +304,16 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 
 	leWg.Add(1)
 	go func() {
-		le.Run(ctx)
+		defer leWg.Done()
+		le.Run(leCtx)
 	}()
 
 	select {
 	case <-leChan:
 		klog.Infof("Acquired leaderelection")
 	case <-stopCh:
-		return fmt.Errorf("interrupted before leaderelection")
+		klog.Info("Interrupted before leaderelection")
+		return nil
 	}
 
 	klog.Infof("loglevel is set to %q", cmdutil.GetLoglevel())
@@ -316,16 +331,16 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		rc.Run(o.Workers, stopCh)
+		rc.Run(ctx, o.Workers)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ac.Run(o.Workers, stopCh)
+		ac.Run(ctx, o.Workers)
 	}()
 
-	<-stopCh
+	<-ctx.Done()
 
 	return nil
 }

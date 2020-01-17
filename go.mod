@@ -3,6 +3,7 @@ module github.com/tnozicka/openshift-acme
 go 1.13
 
 require (
+	github.com/ghodss/yaml v1.0.0
 	github.com/google/go-cmp v0.3.1
 	github.com/onsi/ginkgo v1.11.0
 	github.com/onsi/gomega v1.8.2-0.20191230164726-a31eda7afd3c
@@ -12,8 +13,8 @@ require (
 	github.com/prometheus/client_golang v1.3.0
 	github.com/spf13/cobra v0.0.6-0.20191226175542-bf2689566459
 	github.com/spf13/pflag v1.0.5
-	golang.org/x/crypto v0.0.0-20191227163750-53104e6ec876
-	gopkg.in/yaml.v2 v2.2.7
+	golang.org/x/crypto v0.0.0-20200117160349-530e935923ad
+	gopkg.in/yaml.v2 v2.2.7 // indirect
 	k8s.io/api v0.17.0
 	k8s.io/apimachinery v0.17.0
 	k8s.io/apiserver v0.17.0

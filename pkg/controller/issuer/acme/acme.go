@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ghodss/yaml"
 	"golang.org/x/crypto/acme"
-	"gopkg.in/yaml.v2"
 
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -81,7 +81,12 @@ func NewAccountController(
 		queue: workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
 	}
 
+	if len(kubeInformersForNamespaces.Namespaces()) < 1 {
+		panic("no namespace set up")
+	}
+
 	for _, namespace := range kubeInformersForNamespaces.Namespaces() {
+		klog.V(4).Infof("Setting up kube informers for namespace %q", namespace)
 		informers := kubeInformersForNamespaces.InformersFor(namespace)
 
 		informers.Core().V1().ConfigMaps().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -101,46 +106,48 @@ func NewAccountController(
 	return ac
 }
 
-func (ac *AccountController) Run(workers int, stopCh <-chan struct{}) {
+func (ac *AccountController) Run(ctx context.Context, workers int) {
 	defer utilruntime.HandleCrash()
 	defer ac.queue.ShutDown()
 
+	var wg sync.WaitGroup
 	klog.Info("Starting Account controller")
-	defer klog.Info("Shutting down Account controller")
+	defer func() {
+		klog.Info("Shutting down Account controller")
+		ac.queue.ShutDown()
+		wg.Wait()
+		klog.Info("Account controller shut down")
+	}()
 
-	if !cache.WaitForCacheSync(stopCh, ac.cachesToSync...) {
-		utilruntime.HandleError(fmt.Errorf("timed out waiting for caches to sync"))
+	synced := cache.WaitForNamedCacheSync("account controller", ctx.Done(), ac.cachesToSync...)
+	if !synced {
 		return
 	}
 
-	klog.Info("Account controller informer caches synced")
-
-	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			wait.Until(ac.runWorker, time.Second, stopCh)
+			wait.UntilWithContext(ctx, ac.runWorker, time.Second)
 		}()
 	}
-	defer wg.Wait()
 
-	<-stopCh
+	<-ctx.Done()
 }
 
-func (ac *AccountController) runWorker() {
-	for ac.processNextItem() {
+func (ac *AccountController) runWorker(ctx context.Context) {
+	for ac.processNextItem(ctx) {
 	}
 }
 
-func (ac *AccountController) processNextItem() bool {
+func (ac *AccountController) processNextItem(ctx context.Context) bool {
 	key, quit := ac.queue.Get()
 	if quit {
 		return false
 	}
 	defer ac.queue.Done(key)
 
-	err := ac.sync(key.(string))
+	err := ac.sync(ctx, key.(string))
 
 	if err == nil {
 		ac.queue.Forget(key)
@@ -261,7 +268,7 @@ func (ac *AccountController) deleteSecret(obj interface{}) {
 	}
 }
 
-func (ac *AccountController) sync(key string) error {
+func (ac *AccountController) sync(ctx context.Context, key string) error {
 	klog.V(4).Infof("Started syncing Account %q", key)
 	defer func() {
 		klog.V(4).Infof("Finished syncing Account %q", key)
@@ -312,6 +319,9 @@ func (ac *AccountController) sync(key string) error {
 	// TODO: Validate account fields
 
 	acmeIssuer := certIssuer.AcmeCertIssuer
+	if acmeIssuer == nil {
+		return fmt.Errorf("ACME issuer is missing AcmeCertIssuer spec")
+	}
 
 	client := &acme.Client{
 		DirectoryURL: acmeIssuer.DirectoryUrl,
