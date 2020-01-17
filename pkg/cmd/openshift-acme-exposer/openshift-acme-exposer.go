@@ -126,10 +126,7 @@ func (o *Options) Run(cmd *cobra.Command, out io.Writer) error {
 		return err
 	}
 
-	server := httpserver.Server{
-		ListenAddr:    fmt.Sprintf("%s:%d", o.ListenIP, o.Port),
-		UriToResponse: make(map[string]string),
-	}
+	server := httpserver.NewServer(fmt.Sprintf("%s:%d", o.ListenIP, o.Port), nil)
 
 	err = server.ParseData(bytes)
 	if err != nil {

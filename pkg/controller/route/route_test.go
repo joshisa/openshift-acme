@@ -37,7 +37,7 @@ func TestGetTemporaryName(t *testing.T) {
 
 			errs := validation.NameIsDNSSubdomain(r, false)
 			if len(errs) != 0 {
-				t.Errorf("name isn't DNS subdomain: %v", errs)
+				t.Errorf("name %q isn't DNS subdomain: %v", r, errs)
 			}
 		})
 	}

@@ -7,7 +7,6 @@ import (
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
 	routev1 "github.com/openshift/api/route/v1"
-	"github.com/tnozicka/openshift-acme/pkg/acme/client/builder"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -322,8 +321,8 @@ var _ = g.Describe("Routes", func() {
 				TLS: &routev1.TLSConfig{
 					Termination:                   routev1.TLSTerminationEdge,
 					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyAllow,
-					Key:                           string(certData.Key),
-					Certificate:                   string(certData.Crt),
+					Key:         string(certData.Key),
+					Certificate: string(certData.Crt),
 				},
 			},
 		}
@@ -410,8 +409,8 @@ var _ = g.Describe("Routes", func() {
 				TLS: &routev1.TLSConfig{
 					Termination:                   routev1.TLSTerminationEdge,
 					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyAllow,
-					Key:                           string(certData.Key),
-					Certificate:                   string(certData.Crt),
+					Key:         string(certData.Key),
+					Certificate: string(certData.Crt),
 				},
 			},
 		}

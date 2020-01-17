@@ -6,27 +6,46 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog"
 )
 
 type Server struct {
-	UriToResponse map[string]string
-	ListenAddr    string
+	uriToResponse map[string]string
 
 	server http.Server
+
+	listeningAddr      string
+	listeningAddrMutex sync.Mutex
 }
 
-func (h *Server) handler(w http.ResponseWriter, r *http.Request) {
+func NewServer(listenAddr string, uriToResponse map[string]string) *Server {
+	if uriToResponse == nil {
+		uriToResponse = make(map[string]string)
+	}
+	return &Server{
+		uriToResponse: uriToResponse,
+
+		server: http.Server{
+			Addr: listenAddr,
+		},
+	}
+}
+
+func (s *Server) handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 
-	host, _, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		klog.Error(err)
-		host = r.Host
-	}
-	uri := host + r.URL.String()
-	response, found := h.UriToResponse[uri]
+	// host, _, err := net.SplitHostPort(r.Host)
+	// if err != nil {
+	// 	klog.Error(err)
+	// 	host = r.Host
+	// }
+	// uri := host + r.URL.String()
+	uri := r.URL.String()
+	response, found := s.uriToResponse[uri]
 	klog.V(4).Infof("URI %q %sfound", uri, func() string {
 		if !found {
 			return "not "
@@ -48,7 +67,7 @@ func (h *Server) handler(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func (h *Server) ParseData(data []byte) error {
+func (s *Server) ParseData(data []byte) error {
 	lines := strings.Split(string(data), "\n")
 	klog.Infof("Parsing %d line(s)", len(lines))
 	for n, l := range lines {
@@ -63,38 +82,60 @@ func (h *Server) ParseData(data []byte) error {
 		}
 		uri := parts[0]
 		response := parts[1]
-		h.UriToResponse[uri] = response
+		s.uriToResponse[uri] = response
 	}
 
 	return nil
 }
 
-func (h *Server) Run() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", h.handler)
-	h.server.Handler = mux
-	h.server.Addr = h.ListenAddr
+func (s *Server) setListeningAddr(addr string) {
+	s.listeningAddrMutex.Lock()
+	defer s.listeningAddrMutex.Unlock()
+	s.listeningAddr = addr
+}
 
-	listener, err := net.Listen("tcp", h.server.Addr)
+func (s *Server) getListeningAddr() string {
+	s.listeningAddrMutex.Lock()
+	defer s.listeningAddrMutex.Unlock()
+	return s.listeningAddr
+}
+
+func (s *Server) Run() error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handler)
+	s.server.Handler = mux
+
+	listener, err := net.Listen("tcp", s.server.Addr)
 	if err != nil {
 		return err
 	}
 
 	// if you don't specify addr (e.g. port) we need to find to which it was bound so e.g. tests can use it
-	h.ListenAddr = listener.Addr().String()
-	klog.V(1).Infof("Http-01: server listening on http://%s/", h.ListenAddr)
+	s.setListeningAddr(listener.Addr().String())
+	klog.V(1).Infof("Http-01: server listening on http://%s/", s.listeningAddr)
 
-	err = h.server.Serve(listener)
+	err = s.server.Serve(listener)
 	if err == http.ErrServerClosed {
 		klog.Infof("Server closed gracefully")
 		return nil
 	}
+
 	return err
 }
 
-func (h *Server) Shutdown(ctx context.Context) error {
+func (s *Server) Shutdown(ctx context.Context) error {
 	klog.Infof("Shutting down server...")
 	defer klog.Infof("Server shut down")
 
-	return h.server.Shutdown(ctx)
+	return s.server.Shutdown(ctx)
+}
+
+func (s *Server) WaitForConnect(ctx context.Context, pollInterval time.Duration) error {
+	return wait.PollImmediateUntil(pollInterval, func() (done bool, err error) {
+		_, err = net.DialTimeout("tcp", s.getListeningAddr(), 3*time.Second)
+		if err == nil {
+			return true, nil
+		}
+		return false, nil
+	}, ctx.Done())
 }

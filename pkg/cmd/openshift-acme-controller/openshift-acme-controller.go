@@ -216,7 +216,7 @@ func (o *Options) Complete() error {
 		}
 		o.Namespaces = uniqueNamespaces
 	}
-	klog.V(1).Info("Managing namespaces: %v", o.Namespaces)
+	klog.V(1).Infof("Managing namespaces: %v", o.Namespaces)
 
 	return nil
 }
@@ -286,7 +286,7 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 		Name: "openshift-acme",
 	})
 	if err != nil {
-		return fmt.Errorf("leaderelection failed: %v")
+		return fmt.Errorf("leaderelection failed: %v", err)
 	}
 
 	leWg.Add(1)

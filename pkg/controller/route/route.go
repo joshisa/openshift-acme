@@ -4,9 +4,10 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/rsa"
-	"crypto/sha512"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -14,6 +15,8 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/acme"
@@ -511,11 +514,11 @@ func (rc *RouteController) handle(key string) error {
 
 		if len(reason) == 0 {
 			// Not eligible for renewal
-			klog.V(4).Infof("Route %q doesn't need new cert: %v", key)
+			klog.V(4).Infof("Route %q doesn't need new certificate", key)
 			return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 		}
 
-		klog.V(1).Infof("Route %q needs new cert: %v", key, reason)
+		klog.V(1).Infof("Route %q needs new certificate: %v", key, reason)
 	}
 
 	domain := routeReadOnly.Spec.Host
@@ -536,7 +539,7 @@ func (rc *RouteController) handle(key string) error {
 
 	// Clear stuck provisioning
 	if time.Now().After(status.ProvisioningStatus.StartedAt.Add(rc.orderTimeout)) {
-		klog.Warning("Route %q: Clearing stuck order %q", key, status.ProvisioningStatus.OrderUri)
+		klog.Warningf("Route %q: Clearing stuck order %q", key, status.ProvisioningStatus.OrderUri)
 		status.ProvisioningStatus = nil
 		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 	}
@@ -549,7 +552,7 @@ func (rc *RouteController) handle(key string) error {
 		}
 
 		// The order URI doesn't exist. Delete OrderUri and update the status.
-		klog.Warning("Route %q: Found invalid OrderURI %q, removing it.", key, status.ProvisioningStatus.OrderUri)
+		klog.Warningf("Route %q: Found invalid OrderURI %q, removing it.", key, status.ProvisioningStatus.OrderUri)
 		status.ProvisioningStatus.OrderUri = ""
 		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 	}
@@ -867,7 +870,7 @@ func (rc *RouteController) handle(key string) error {
 			},
 		}
 		template.DNSNames = append(template.DNSNames, routeReadOnly.Spec.Host)
-		klog.V(4).Infof("Route %q: Order %q: CSR template: %#v", template)
+		klog.V(4).Infof("Route %q: Order %q: CSR template: %#v", key, order, template)
 		privateKey, err := rsa.GenerateKey(cryptorand.Reader, 4096)
 		if err != nil {
 			return fmt.Errorf("failed to generate RSA key: %v", err)
@@ -918,7 +921,7 @@ func (rc *RouteController) handle(key string) error {
 		// TODO: backoff but capped at some reasonable time
 		rc.queue.AddAfter(routeReadOnly, 15*time.Second)
 
-		klog.V(4).Infof("Route %q: Order %q: Waiting to be validated by ACME server")
+		klog.V(4).Infof("Route %q: Order %q: Waiting to be validated by ACME server", key, order)
 
 		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
 
@@ -1102,13 +1105,20 @@ func (rc *RouteController) Run(workers int, stopCh <-chan struct{}) {
 
 	klog.Info("Route controller informer caches synced")
 
+	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		go wait.Until(rc.runWorker, time.Second, stopCh)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wait.Until(rc.runWorker, time.Second, stopCh)
+		}()
 	}
+	defer wg.Wait()
 
 	<-stopCh
 }
 
 func getTemporaryName(key string) string {
-	return fmt.Sprintf("acme-exposer-%s", sha512.Sum512([]byte(key)))
+	sum := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("acme-exposer-%s", strings.ToLower(base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])))
 }

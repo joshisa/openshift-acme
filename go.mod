@@ -3,6 +3,7 @@ module github.com/tnozicka/openshift-acme
 go 1.13
 
 require (
+	github.com/google/go-cmp v0.3.1
 	github.com/onsi/ginkgo v1.11.0
 	github.com/onsi/gomega v1.8.2-0.20191230164726-a31eda7afd3c
 	github.com/openshift/api v0.0.0-20200102191951-7e36eed0d19e

@@ -115,9 +115,15 @@ func (ac *AccountController) Run(workers int, stopCh <-chan struct{}) {
 
 	klog.Info("Account controller informer caches synced")
 
+	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		go wait.Until(ac.runWorker, time.Second, stopCh)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wait.Until(ac.runWorker, time.Second, stopCh)
+		}()
 	}
+	defer wg.Wait()
 
 	<-stopCh
 }
@@ -233,14 +239,14 @@ func (ac *AccountController) deleteSecret(obj interface{}) {
 	for _, cm := range allConfigMaps {
 		certIssuerData, ok := cm.Data[api.CertIssuerDataKey]
 		if !ok {
-			klog.Warning("ConfigMap %s/%s is matching CertIssuer selectors %q but missing key %q", cm.Namespace, cm.Name, api.AccountLabelSet, api.CertIssuerDataKey)
+			klog.Warningf("ConfigMap %s/%s is matching CertIssuer selectors %q but missing key %q", cm.Namespace, cm.Name, api.AccountLabelSet, api.CertIssuerDataKey)
 			continue
 		}
 
 		certIssuer := &api.CertIssuer{}
 		err := yaml.Unmarshal([]byte(certIssuerData), certIssuer)
 		if err != nil {
-			klog.Warning("ConfigMap %s/%s is matching CertIssuer selectors %q but contains invalid object: %w", cm.Namespace, cm.Name, api.AccountLabelSet, err)
+			klog.Warningf("ConfigMap %s/%s is matching CertIssuer selectors %q but contains invalid object: %w", cm.Namespace, cm.Name, api.AccountLabelSet, err)
 			continue
 		}
 
