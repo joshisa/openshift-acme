@@ -259,7 +259,7 @@ func (ac *AccountController) deleteSecret(obj interface{}) {
 
 		switch certIssuer.Type {
 		case api.CertIssuerTypeAcme:
-			if certIssuer.AcmeCertIssuer.AccountCredentialsSecretName == secret.Name {
+			if certIssuer.SecretName == secret.Name {
 				ac.enqueueAccount(cm)
 			}
 		default:
@@ -276,18 +276,16 @@ func (ac *AccountController) sync(ctx context.Context, key string) error {
 
 	namespace, _, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		utilruntime.HandleError(err)
 		return err
 	}
 
 	objReadOnly, exists, err := ac.kubeInformersForNamespaces.InformersForOrGlobal(namespace).Core().V1().ConfigMaps().Informer().GetIndexer().GetByKey(key)
 	if err != nil {
-		klog.Errorf("Fetching object with key %s from store failed with %w", key, err)
-		return err
+		return fmt.Errorf("fetching object with key %q from store failed: %w", key, err)
 	}
 
 	if !exists {
-		klog.V(4).Infof("ConfigMap %s does not exist anymore\n", key)
+		klog.V(4).Infof("ConfigMap %q does not exist anymore\n", key)
 		return nil
 	}
 
@@ -300,13 +298,13 @@ func (ac *AccountController) sync(ctx context.Context, key string) error {
 
 	certIssuerData, ok := cmReadOnly.Data[api.CertIssuerDataKey]
 	if !ok {
-		return fmt.Errorf("configmap %s is matching CertIssuer selectors %q but missing key %q", key, api.AccountLabelSet, api.CertIssuerDataKey)
+		return fmt.Errorf("configmap %q is matching CertIssuer selectors %q but missing key %q", key, api.AccountLabelSet, api.CertIssuerDataKey)
 	}
 
 	certIssuer := &api.CertIssuer{}
 	err = yaml.Unmarshal([]byte(certIssuerData), certIssuer)
 	if err != nil {
-		return fmt.Errorf("configmap %s is matching CertIssuer selectors %q but contains invalid object: %w", key, api.AccountLabelSet, err)
+		return fmt.Errorf("configmap %q is matching CertIssuer selectors %q but contains invalid object: %w", key, api.AccountLabelSet, err)
 	}
 
 	switch certIssuer.Type {
@@ -327,18 +325,19 @@ func (ac *AccountController) sync(ctx context.Context, key string) error {
 		DirectoryURL: acmeIssuer.DirectoryUrl,
 		UserAgent:    "github.com/tnozicka/openshift-acme",
 	}
-	account := &acme.Account{
-		Contact: acmeIssuer.Account.Contacts,
+
+	var account *acme.Account
+
+	if len(certIssuer.SecretName) == 0 {
+		certIssuer.SecretName = cmReadOnly.Name
 	}
 
-	if len(acmeIssuer.AccountCredentialsSecretName) == 0 {
-		acmeIssuer.AccountCredentialsSecretName = cmReadOnly.Name
-	}
+	secret, err := ac.kubeInformersForNamespaces.InformersForOrGlobal(cmReadOnly.Namespace).Core().V1().Secrets().Lister().Secrets(cmReadOnly.Namespace).Get(certIssuer.SecretName)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
 
-	secret, err := ac.kubeInformersForNamespaces.InformersForOrGlobal(cmReadOnly.Namespace).Core().V1().Secrets().Lister().Secrets(cmReadOnly.Namespace).Get(acmeIssuer.AccountCredentialsSecretName)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
-	} else if apierrors.IsNotFound(err) {
 		// Register new account
 		privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
 		if err != nil {
@@ -353,6 +352,9 @@ func (ac *AccountController) sync(ctx context.Context, key string) error {
 
 		registerCtx, registerCtxCancel := context.WithTimeout(context.TODO(), 15*time.Second)
 		defer registerCtxCancel()
+		account = &acme.Account{
+			Contact: acmeIssuer.Account.Contacts,
+		}
 		account, err = client.Register(registerCtx, account, acceptTerms)
 		if err != nil {
 			return err
@@ -360,7 +362,7 @@ func (ac *AccountController) sync(ctx context.Context, key string) error {
 
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: acmeIssuer.AccountCredentialsSecretName,
+				Name: certIssuer.SecretName,
 			},
 			Type: corev1.SecretTypeOpaque,
 			Data: map[string][]byte{
@@ -371,42 +373,51 @@ func (ac *AccountController) sync(ctx context.Context, key string) error {
 		if err != nil {
 			return err
 		}
-	} else {
-		client.Key, err = helpers.PrivateKeyFromSecret(secret)
+		ac.recorder.Eventf(cmReadOnly, corev1.EventTypeNormal, "AcmeAccountProvisioned", "Provisioned new ACME account for issuer %q because its secret %s/%s was missing.", key, secret.Namespace, secret.Name)
+	}
+	if err != nil {
+		return err
+	}
+
+	client.Key, err = helpers.PrivateKeyFromSecret(secret)
+	if err != nil {
+		return err
+	}
+
+	// TODO: sign statuses with client.Key.Sign so the can't be modified externally
+
+	accountHash := hashAccount(acmeIssuer.Account)
+
+	if reflect.DeepEqual(accountHash, []byte(acmeIssuer.Account.Status.Hash)) {
+		// Update the acme account to reflect user changes
+		account.Contact = acmeIssuer.Account.Contacts
+
+		updateCtx, updateCtxCancel := context.WithTimeout(context.TODO(), 15*time.Second)
+		defer updateCtxCancel()
+		account, err = client.UpdateReg(updateCtx, account)
 		if err != nil {
 			return err
 		}
-
-		// Todo sign statuses with client.Key.Sign so the can't be modified externally
-
-		accountHash := hashAccount(acmeIssuer.Account)
-
-		if reflect.DeepEqual(accountHash, []byte(acmeIssuer.Account.Status.Hash)) {
-			// Update the acme account to reflect user changes
-			account.Contact = acmeIssuer.Account.Contacts
-
-			updateCtx, updateCtxCancel := context.WithTimeout(context.TODO(), 15*time.Second)
-			defer updateCtxCancel()
-			account, err = client.UpdateReg(updateCtx, account)
-			if err != nil {
-				return err
-			}
-		} else if len(acmeIssuer.Account.Status.URI) == 0 {
-			getRegCtx, getRegCtxCancel := context.WithTimeout(context.TODO(), 15*time.Second)
-			defer getRegCtxCancel()
-			// url argument is not needed for RFC 8555 compliant CAs
-			account, err = client.GetReg(getRegCtx, "")
-			if err != nil {
-				return err
-			}
+		ac.recorder.Event(cmReadOnly, corev1.EventTypeNormal, "AcmeAccountUpdated", "ACME account was updated to reflect data in API.")
+		klog.V(2).Infof("Updated ACME account %s/%s to: %#v", cmReadOnly.Namespace, cmReadOnly.Name, account)
+	} else if len(acmeIssuer.Account.Status.URI) == 0 {
+		getRegCtx, getRegCtxCancel := context.WithTimeout(context.TODO(), 15*time.Second)
+		defer getRegCtxCancel()
+		// url argument is not needed for RFC 8555 compliant CAs
+		account, err = client.GetReg(getRegCtx, "")
+		if err != nil {
+			return err
 		}
+		klog.V(2).Infof("Refreshed account object %s/%s with data from ACME ", cmReadOnly.Namespace, cmReadOnly.Name, account)
 	}
 
-	acmeIssuer.Account.Status.URI = account.URI
-	acmeIssuer.Account.Contacts = account.Contact
-	acmeIssuer.Account.Status.OrdersURL = account.OrdersURL
-	acmeIssuer.Account.Status.AccountStatus = account.Status
-	acmeIssuer.Account.Status.Hash = fmt.Sprint(hashAccount(acmeIssuer.Account))
+	if account != nil {
+		acmeIssuer.Account.Status.URI = account.URI
+		acmeIssuer.Account.Contacts = account.Contact
+		acmeIssuer.Account.Status.OrdersURL = account.OrdersURL
+		acmeIssuer.Account.Status.AccountStatus = account.Status
+		acmeIssuer.Account.Status.Hash = fmt.Sprint(hashAccount(acmeIssuer.Account))
+	}
 
 	cm := cmReadOnly.DeepCopy()
 	certIssuerBytes, err := yaml.Marshal(certIssuer)

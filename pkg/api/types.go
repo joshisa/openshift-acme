@@ -11,6 +11,7 @@ const (
 	AcmePriorityAnnotation = "acme.openshift.io/priority"
 	AcmeTemporaryLabel     = "acme.openshift.io/temporary"
 	AcmeExposerId          = "acme.openshift.io/exposer-id"
+	AcmeCertIssuerName     = "acme.openshift.io/cert-issuer-name"
 )
 
 type CertIssuerType string
@@ -33,14 +34,14 @@ type AcmeAccount struct {
 }
 
 type AcmeCertIssuer struct {
-	AccountCredentialsSecretName string      `json:"accountCredentialsSecretName"`
-	DirectoryUrl                 string      `json:"directoryUrl"`
-	Account                      AcmeAccount `json:"account"`
+	DirectoryUrl string      `json:"directoryUrl"`
+	Account      AcmeAccount `json:"account"`
 }
 
 type CertIssuer struct {
-	Type CertIssuerType `json:"type"`
+	SecretName string `json:"secretName"`
 
+	Type           CertIssuerType  `json:"type"`
 	AcmeCertIssuer *AcmeCertIssuer `json:"acmeCertIssuer"`
 }
 

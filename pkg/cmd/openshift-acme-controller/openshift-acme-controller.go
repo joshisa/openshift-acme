@@ -205,6 +205,9 @@ func (o *Options) Complete() error {
 		// empty namespace will lead to creating cluster wide informers
 		o.Namespaces = []string{metav1.NamespaceAll}
 	} else {
+		// We must watch our own namespace for global issuers
+		o.Namespaces = append(o.Namespaces, o.ControllerNamespace)
+
 		seen := map[string]struct{}{}
 		var uniqueNamespaces []string
 		for _, ns := range o.Namespaces {
@@ -285,10 +288,9 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 					klog.Info("leaderelection lock released")
 
 					// fail safe
-					go func() {
-						time.Sleep(3 * time.Second)
+					time.AfterFunc(3*time.Second, func() {
 						klog.Fatalf("Failed to exit in time after releasing leaderelection lock")
-					}()
+					})
 
 				default:
 					// Leader election lost
@@ -323,7 +325,7 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 
 	ac := acmeissuer.NewAccountController(o.kubeClient, kubeInformersForNamespaces)
 
-	rc := routecontroller.NewRouteController(o.AcmeOrderTimeout, o.ExposerImage, o.kubeClient, kubeInformersForNamespaces, o.routeClient, routeInformersForNamespaces)
+	rc := routecontroller.NewRouteController(o.AcmeOrderTimeout, o.ExposerImage, o.ControllerNamespace, o.kubeClient, kubeInformersForNamespaces, o.routeClient, routeInformersForNamespaces)
 
 	kubeInformersForNamespaces.Start(stopCh)
 	routeInformersForNamespaces.Start(stopCh)

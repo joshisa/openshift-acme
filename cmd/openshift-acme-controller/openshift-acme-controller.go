@@ -8,7 +8,11 @@ import (
 	"runtime"
 	"time"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog"
+
+	routev1 "github.com/openshift/api/route/v1"
 
 	"github.com/tnozicka/openshift-acme/pkg/cmd/genericclioptions"
 	cmd "github.com/tnozicka/openshift-acme/pkg/cmd/openshift-acme-controller"
@@ -28,6 +32,8 @@ func main() {
 	if len(os.Getenv("GOMAXPROCS")) == 0 {
 		runtime.GOMAXPROCS(runtime.NumCPU())
 	}
+
+	utilruntime.Must(routev1.Install(scheme.Scheme))
 
 	command := cmd.NewOpenshiftAcmeControllerCommand(genericclioptions.IOStreams{
 		In:     os.Stdin,
