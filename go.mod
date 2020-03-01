@@ -9,8 +9,8 @@ require (
 	github.com/onsi/ginkgo v1.11.0
 	github.com/onsi/gomega v1.8.2-0.20191230164726-a31eda7afd3c
 	github.com/openshift/api v0.0.0-20200102191951-7e36eed0d19e
+	github.com/openshift/build-machinery-go v0.0.0-20200211121458-5e3d6e570160
 	github.com/openshift/client-go v0.0.0-20191219165006-ac3b642258cc
-	github.com/openshift/library-go v0.0.0-20200103144857-38e0f6451b16
 	github.com/prometheus/client_golang v1.3.0
 	github.com/spf13/cobra v0.0.6-0.20191226175542-bf2689566459
 	github.com/spf13/pflag v1.0.5
