@@ -142,7 +142,7 @@ func TestIsManaged(t *testing.T) {
 	}
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
-			got := IsManaged(tc.obj)
+			got := IsManaged(tc.obj, "kubernetes.io/tls-acme")
 			if got != tc.expectedResult {
 				t.Errorf("expected %t, got %t", tc.expectedResult, got)
 			}

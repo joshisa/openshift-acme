@@ -10,9 +10,9 @@ spec:
   selector:
     matchLabels:
       app: openshift-acme
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
   template:
     metadata:
       labels:
@@ -23,14 +23,5 @@ spec:
       - name: openshift-acme
         image: " "
         imagePullPolicy: Always
-        ports:
-        - containerPort: 5000
-        env:
-        - name: OPENSHIFT_ACME_EXPOSER_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
-        - name: OPENSHIFT_ACME_ACMEURL
-          value: "https://acme-v01.api.letsencrypt.org/directory"
-        - name: OPENSHIFT_ACME_LOGLEVEL
-          value: "4"
+        args:
+        - --loglevel=4

@@ -5,12 +5,14 @@ import (
 )
 
 const (
-	TlsAcmeAnnotation = "kubernetes.io/tls-acme"
+	DefaultTlsAcmeAnnotation = "kubernetes.io/tls-acme"
 
 	AcmeStatusAnnotation   = "acme.openshift.io/status"
 	AcmePriorityAnnotation = "acme.openshift.io/priority"
 	AcmeTemporaryLabel     = "acme.openshift.io/temporary"
 	AcmeExposerId          = "acme.openshift.io/exposer-id"
+	AcmeExposerKey         = "acme.openshift.io/exposer-key"
+	AcmeExposerUID         = "acme.openshift.io/exposer-uid"
 	AcmeCertIssuerName     = "acme.openshift.io/cert-issuer-name"
 )
 
@@ -34,7 +36,7 @@ type AcmeAccount struct {
 }
 
 type AcmeCertIssuer struct {
-	DirectoryUrl string      `json:"directoryUrl"`
+	DirectoryURL string      `json:"directoryURL"`
 	Account      AcmeAccount `json:"account"`
 }
 
@@ -72,14 +74,20 @@ type CertProvisioningStatus struct {
 	// startedAt marks the time when the provisioning process begun.
 	StartedAt time.Time `json:"startedAt,omitempty"`
 
+	// EarliestAttemptAt marks the earliest time the provisioning process can be retried.
+	EarliestAttemptAt time.Time `json:"earliestAttemptAt,omitempty"`
+
+	// startedAt marks the time when the provisioning process begun.
+	Failures int `json:"failures,omitempty"`
+
 	// orderUri, if not empty, holds the URI for active certificate order.
-	OrderUri string `json:"orderUri,omitempty"`
+	OrderURI string `json:"orderURI,omitempty"`
 
 	// orderStatus hold the status of the active order.
 	OrderStatus string `json:"orderStatus,omitempty"`
 
 	// orderError hold the details if the order failed
-	OrderError *OrderError `json:"orderStatus,omitempty"`
+	OrderError *OrderError `json:"orderError,omitempty"`
 
 	// accountHash holds the internal identification on the account.
 	AccountHash string `json:"accountHash,omitempty"`

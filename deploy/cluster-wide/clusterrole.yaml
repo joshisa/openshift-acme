@@ -32,30 +32,7 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - update
-  - patch
-
-- apiGroups:
-  - ""
-  resources:
-  - endpoints
-  - endpoints/restricted
   - services
-  verbs:
-  - create
-  - get
-  - list
-  - watch
-  - update
-  - patch
-  - delete
-
-- apiGroups:
-  - ""
-  resources:
   - secrets
   - secrets/finalizers
   verbs:
@@ -66,3 +43,12 @@ rules:
   - update
   - patch
   - delete
+
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - update
+  - patch

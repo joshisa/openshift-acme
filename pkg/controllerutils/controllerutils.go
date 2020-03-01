@@ -1,11 +1,15 @@
 package controllerutils
 
 import (
+	"crypto/tls"
 	"fmt"
+	"io"
+	"net/http"
 	"sort"
 	"strconv"
 
 	"github.com/ghodss/yaml"
+	"github.com/tnozicka/openshift-acme/pkg/util"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog"
@@ -105,7 +109,7 @@ func IssuerForObject(obj metav1.ObjectMeta, globalIssuerNamespace string, kubeIn
 	}
 
 	if len(certIssuer.SecretName) == 0 {
-		return certIssuer, nil, nil
+		return certIssuer, nil, fmt.Errorf("cert issuer %s/%s is missing required secret", certIssuerCM.Namespace, certIssuerCM.Name)
 	}
 
 	secret, err := kubeInformersForNamespaces.InformersForOrGlobal(certIssuerCM.Namespace).Core().V1().Secrets().Lister().Secrets(certIssuerCM.Namespace).Get(certIssuer.SecretName)
@@ -114,4 +118,38 @@ func IssuerForObject(obj metav1.ObjectMeta, globalIssuerNamespace string, kubeIn
 	}
 
 	return certIssuer, secret, nil
+}
+
+func ValidateExposedToken(url, expectedData string) error {
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+	client := &http.Client{Transport: tr}
+
+	response, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("can't GET %q: %w", url, err)
+	}
+	defer response.Body.Close()
+
+	// No response should be longer that this, we need to prevent against DoS
+	buffer := make([]byte, 2048)
+	n, err := response.Body.Read(buffer)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("can't read response body into buffer: %w", err)
+	}
+	body := string(buffer[:n])
+
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("getting %q return status code %d, expected %d: status %q: content head: %s", url, response.StatusCode, http.StatusOK, response.Status, util.FirstNLines(util.MaxNCharacters(body, 160), 5))
+	}
+
+	if body != expectedData {
+		return fmt.Errorf("response body doesn't match expected data")
+	}
+
+	return nil
 }

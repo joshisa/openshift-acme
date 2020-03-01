@@ -16,13 +16,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/ghodss/yaml"
-	"github.com/tnozicka/openshift-acme/pkg/controllerutils"
 	"golang.org/x/crypto/acme"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	kapierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -30,14 +33,17 @@ import (
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
 
 	routev1 "github.com/openshift/api/route/v1"
 	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
 	_ "github.com/openshift/client-go/route/clientset/versioned/scheme"
+
 	"github.com/tnozicka/openshift-acme/pkg/api"
 	"github.com/tnozicka/openshift-acme/pkg/cert"
+	"github.com/tnozicka/openshift-acme/pkg/controllerutils"
 	"github.com/tnozicka/openshift-acme/pkg/helpers"
 	kubeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/kube"
 	routeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/route"
@@ -50,10 +56,11 @@ const (
 	ExposerFileKey = "exposer-file"
 	// Remove this when we have separate rate limiting for ACME.
 	// Now it will get eventually reconciled when informers re-sync or on edit.
-	MaxRetries               = 50 // 2
 	RenewalStandardDeviation = 1
 	RenewalMean              = 0
 	AcmeTimeout              = 60 * time.Second
+	// BackoffGCInterval is the time that has to pass before next iteration of backoff GC is run
+	BackoffGCInterval = 1 * time.Minute
 )
 
 var (
@@ -63,15 +70,14 @@ var (
 )
 
 type RouteController struct {
-	orderTimeout        time.Duration
-	exposerImage        string
-	controllerNamespace string
+	annotation              string
+	certOrderBackoffInitial time.Duration
+	certOrderBackoffMax     time.Duration
+	exposerImage            string
+	controllerNamespace     string
 
 	kubeClient                 kubernetes.Interface
 	kubeInformersForNamespaces kubeinformers.Interface
-
-	// appsClient                 kubernetes.Interface
-	// appsInformersForNamespaces kubeinformers.Interface
 
 	routeClient                 routeclientset.Interface
 	routeInformersForNamespaces routeinformers.Interface
@@ -84,7 +90,9 @@ type RouteController struct {
 }
 
 func NewRouteController(
-	orderTimeout time.Duration,
+	annotation string,
+	certOrderBackoffInitial time.Duration,
+	certOrderBackoffMax time.Duration,
 	exposerImage string,
 	controllerNamespace string,
 	kubeClient kubernetes.Interface,
@@ -97,9 +105,11 @@ func NewRouteController(
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 
 	rc := &RouteController{
-		orderTimeout:        orderTimeout,
-		exposerImage:        exposerImage,
-		controllerNamespace: controllerNamespace,
+		annotation:              annotation,
+		certOrderBackoffInitial: certOrderBackoffInitial,
+		certOrderBackoffMax:     certOrderBackoffMax,
+		exposerImage:            exposerImage,
+		controllerNamespace:     controllerNamespace,
 
 		kubeClient:                 kubeClient,
 		kubeInformersForNamespaces: kubeInformersForNamespaces,
@@ -138,19 +148,23 @@ func NewRouteController(
 
 		informers := kubeInformersForNamespaces.InformersFor(namespace)
 
-		informers.Core().V1().Secrets().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-			UpdateFunc: rc.updateSecret,
-			DeleteFunc: rc.deleteSecret,
-		})
+		// informers.Core().V1().Secrets().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		// 	UpdateFunc: rc.updateSecret,
+		// 	DeleteFunc: rc.deleteSecret,
+		// })
 		rc.cachesToSync = append(rc.cachesToSync, informers.Core().V1().Secrets().Informer().HasSynced)
 
-		// TODO: likely requeue on exposer objects too
-		rc.cachesToSync = append(rc.cachesToSync, informers.Core().V1().Pods().Informer().HasSynced)
+		// FIXME: requeue on exposer objects
 		rc.cachesToSync = append(rc.cachesToSync, informers.Core().V1().Services().Informer().HasSynced)
+
+		informers.Apps().V1().ReplicaSets().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    rc.addReplicaSet,
+			UpdateFunc: rc.updateReplicaSet,
+			DeleteFunc: rc.deleteReplicaSet,
+		})
 		rc.cachesToSync = append(rc.cachesToSync, informers.Apps().V1().ReplicaSets().Informer().HasSynced)
 
 		// We need to watch CM for global and local issuers
-		// TODO: requeue routes possibly referencing the issuers
 		rc.cachesToSync = append(rc.cachesToSync, informers.Core().V1().ConfigMaps().Informer().HasSynced)
 	}
 
@@ -169,12 +183,11 @@ func (rc *RouteController) enqueueRoute(route *routev1.Route) {
 
 func (rc *RouteController) addRoute(obj interface{}) {
 	route := obj.(*routev1.Route)
-	if !util.IsManaged(route) {
-		klog.V(5).Infof("Skipping Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
+	if !util.IsManaged(route, rc.annotation) {
 		return
 	}
 
-	klog.V(4).Infof("Adding Route %s/%s UID=%s RV=%s; %#v", route.Namespace, route.Name, route.UID, route.ResourceVersion, route)
+	klog.V(4).Infof("Adding Route %s/%s RV=%s UID=%s", route.Namespace, route.Name, route.ResourceVersion, route.UID)
 	rc.enqueueRoute(route)
 }
 
@@ -182,15 +195,11 @@ func (rc *RouteController) updateRoute(old, cur interface{}) {
 	oldRoute := old.(*routev1.Route)
 	newRoute := cur.(*routev1.Route)
 
-	if !util.IsManaged(newRoute) {
-		klog.V(5).Infof("Skipping Route %s/%s UID=%s RV=%s", newRoute.Namespace, newRoute.Name, newRoute.UID, newRoute.ResourceVersion)
+	if !util.IsManaged(newRoute, rc.annotation) {
 		return
 	}
 
-	klog.V(4).Infof("Updating Route from %s/%s UID=%s RV=%s to %s/%s UID=%s,RV=%s",
-		oldRoute.Namespace, oldRoute.Name, oldRoute.UID, oldRoute.ResourceVersion,
-		newRoute.Namespace, newRoute.Name, newRoute.UID, newRoute.ResourceVersion)
-
+	klog.V(4).Infof("Updating Route %s/%s RV=%s->%s UID=%s->%s", newRoute.Namespace, newRoute.Name, oldRoute.ResourceVersion, newRoute.ResourceVersion, oldRoute.UID, newRoute.UID)
 	rc.enqueueRoute(newRoute)
 }
 
@@ -209,13 +218,65 @@ func (rc *RouteController) deleteRoute(obj interface{}) {
 		}
 	}
 
-	if !util.IsManaged(route) {
-		klog.V(5).Infof("Skipping Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
+	if !util.IsManaged(route, rc.annotation) {
+		// TODO: if it is the exposer route we need to requeue the parrent route
+
+		klog.V(5).Infof("Skipping Route %s/%s RV=%s UID=%s", route.Namespace, route.Name, route.ResourceVersion, route.UID)
 		return
 	}
 
-	klog.V(4).Infof("Deleting Route %s/%s UID=%s RV=%s", route.Namespace, route.Name, route.UID, route.ResourceVersion)
+	klog.V(4).Infof("Deleting Route %s/%s RV=%s UID=%s", route.Namespace, route.Name, route.ResourceVersion, route.UID)
 	rc.enqueueRoute(route)
+}
+
+func (rc *RouteController) enqueueOwningRoute(obj metav1.Object) {
+	routeKey, ok := obj.GetAnnotations()[api.AcmeExposerKey]
+	if !ok {
+		return
+	}
+
+	objReadOnly, exists, err := rc.routeInformersForNamespaces.InformersForOrGlobal(obj.GetNamespace()).Route().V1().Routes().Informer().GetIndexer().GetByKey(routeKey)
+	if err != nil {
+		klog.Errorf("Fetching object with key %s from store failed with %w", routeKey, err)
+		return
+	}
+	if !exists {
+		return
+	}
+
+	route := objReadOnly.(*routev1.Route)
+	if !util.IsManaged(route, rc.annotation) {
+		return
+	}
+
+	rc.queue.Add(routeKey)
+}
+
+func (rc *RouteController) addReplicaSet(obj interface{}) {
+	rc.enqueueOwningRoute(obj.(*appsv1.ReplicaSet))
+}
+
+func (rc *RouteController) updateReplicaSet(old, cur interface{}) {
+	rc.enqueueOwningRoute(old.(*appsv1.ReplicaSet))
+	rc.enqueueOwningRoute(cur.(*appsv1.ReplicaSet))
+}
+
+func (rc *RouteController) deleteReplicaSet(obj interface{}) {
+	rs, ok := obj.(*appsv1.ReplicaSet)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("object is not a ReplicaSet neither tombstone: %#v", obj))
+			return
+		}
+		rs, ok = tombstone.Obj.(*appsv1.ReplicaSet)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a ReplicaSet %#v", obj))
+			return
+		}
+	}
+
+	rc.enqueueOwningRoute(rs)
 }
 
 func (rc *RouteController) updateSecret(old, cur interface{}) {
@@ -355,38 +416,40 @@ func (rc *RouteController) getStatus(routeReadOnly *routev1.Route) (*api.Status,
 	return status, nil
 }
 
-func (rc *RouteController) setStatus(route *routev1.Route, status *api.Status) error {
-	status.ObservedGeneration = route.Generation
+func (rc *RouteController) updateStatus(routeReadOnly *routev1.Route, status *api.Status) error {
+	var oldRouteReadOnly *routev1.Route
+	var err error
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if oldRouteReadOnly == nil {
+			oldRouteReadOnly = routeReadOnly
+		} else {
+			oldRouteReadOnly, err = rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Get(routeReadOnly.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+		}
 
-	// TODO: sign the status
+		newRoute := oldRouteReadOnly.DeepCopy()
 
-	bytes, err := yaml.Marshal(status)
+		err := setStatus(&newRoute.ObjectMeta, status)
+		if err != nil {
+			return fmt.Errorf("can't set status: %w", err)
+		}
+
+		if reflect.DeepEqual(newRoute, oldRouteReadOnly) {
+			return nil
+		}
+
+		klog.V(4).Info(spew.Sprintf("Updating status for Route %s/%s to %#v", newRoute.Namespace, newRoute.Name, status))
+		// The controller is the sole owner of the status.
+		// Use Patch so we don't loose ACME information due to conflicts on the object. (e.g. on stale caches)
+
+		_, err = rc.routeClient.RouteV1().Routes(newRoute.Namespace).Update(newRoute)
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("can't encode status annotation: %v", err)
+		return fmt.Errorf("can't update status: %w", err)
 	}
-
-	metav1.SetMetaDataAnnotation(&route.ObjectMeta, api.AcmeStatusAnnotation, string(bytes))
-
-	return nil
-}
-
-func (rc *RouteController) updateStatus(route *routev1.Route, status *api.Status) error {
-	oldRoute := route.DeepCopy()
-
-	err := rc.setStatus(route, status)
-	if err != nil {
-		return fmt.Errorf("can't set status: %v", err)
-	}
-
-	if reflect.DeepEqual(route, oldRoute) {
-		return nil
-	}
-
-	_, err = rc.routeClient.RouteV1().Routes(route.Namespace).Update(route)
-	if err != nil {
-		return fmt.Errorf("can't update status: %v", err)
-	}
-
 	return nil
 }
 
@@ -404,7 +467,7 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 
 	objReadOnly, exists, err := rc.routeInformersForNamespaces.InformersForOrGlobal(namespace).Route().V1().Routes().Informer().GetIndexer().GetByKey(key)
 	if err != nil {
-		klog.Errorf("Fetching object with key %s from store failed with %v", key, err)
+		klog.Errorf("Fetching object with key %s from store failed with %w", key, err)
 		return err
 	}
 
@@ -421,7 +484,7 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 	}
 
 	// Although we check when adding the Route into the queue it might have been waiting for a while and edited
-	if !util.IsManaged(routeReadOnly) {
+	if !util.IsManaged(routeReadOnly, rc.annotation) {
 		klog.V(4).Infof("Skipping Route %s/%s UID=%s RV=%s", routeReadOnly.Namespace, routeReadOnly.Name, routeReadOnly.UID, routeReadOnly.ResourceVersion)
 		return nil
 	}
@@ -430,6 +493,26 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 	if !routeutil.IsAdmitted(routeReadOnly) {
 		klog.V(4).Infof("Skipping Route %s because it's not admitted", key)
 		return nil
+	}
+
+	status, err := rc.getStatus(routeReadOnly)
+	if err != nil {
+		return fmt.Errorf("can't get status: %v", err)
+	}
+
+	if status.ProvisioningStatus == nil {
+		reason, err := needsCertKey(time.Now(), routeReadOnly)
+		if err != nil {
+			return err
+		}
+
+		if len(reason) == 0 {
+			// Not eligible for renewal
+			klog.V(4).Infof("Route %q doesn't need new certificate", key)
+			return rc.updateStatus(routeReadOnly, status)
+		}
+
+		klog.V(1).Infof("Route %q needs new certificate: %v", key, reason)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), AcmeTimeout)
@@ -452,33 +535,14 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 	}
 
 	acmeClient := &acme.Client{
-		DirectoryURL: acmeIssuer.DirectoryUrl,
+		DirectoryURL: acmeIssuer.DirectoryURL,
 		UserAgent:    "github.com/tnozicka/openshift-acme",
 	}
+	klog.V(4).Infof("Using ACME client with DirectoryURL %q", acmeClient.DirectoryURL)
 
 	acmeClient.Key, err = helpers.PrivateKeyFromSecret(certIssuerSecret)
 	if err != nil {
 		return err
-	}
-
-	status, err := rc.getStatus(routeReadOnly)
-	if err != nil {
-		return fmt.Errorf("can't get status: %v", err)
-	}
-
-	if status.ProvisioningStatus == nil {
-		reason, err := needsCertKey(time.Now(), routeReadOnly)
-		if err != nil {
-			return err
-		}
-
-		if len(reason) == 0 {
-			// Not eligible for renewal
-			klog.V(4).Infof("Route %q doesn't need new certificate", key)
-			return rc.updateStatus(routeReadOnly.DeepCopy(), status)
-		}
-
-		klog.V(1).Infof("Route %q needs new certificate: %v", key, reason)
 	}
 
 	domain := routeReadOnly.Spec.Host
@@ -486,28 +550,49 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 	if status.ProvisioningStatus == nil {
 		status.ProvisioningStatus = &api.CertProvisioningStatus{}
 	}
-	if len(status.ProvisioningStatus.OrderUri) == 0 {
-		order, err := acmeClient.AuthorizeOrder(ctx, acme.DomainIDs(domain))
-		if err != nil {
-			return err
+
+	backoff := time.Duration(0)
+	for i := 0; i < status.ProvisioningStatus.Failures; i++ {
+		backoff *= rc.certOrderBackoffInitial
+		if backoff >= rc.certOrderBackoffMax {
+			backoff = rc.certOrderBackoffMax
+			break
 		}
-		klog.V(1).Infof("Created Order %q for Route %q", order.URI, key)
+	}
+	status.ProvisioningStatus.EarliestAttemptAt = status.ProvisioningStatus.StartedAt.Add(backoff)
 
-		// We need to store the order URI immediately to prevent loosing it on error.
-		// Updating the route will make it requeue.
-		status.ProvisioningStatus.StartedAt = time.Now()
-		status.ProvisioningStatus.OrderUri = order.URI
-		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+	switch status.ProvisioningStatus.OrderStatus {
+	case acme.StatusValid:
+		break
+
+	case acme.StatusInvalid, acme.StatusExpired, acme.StatusRevoked, acme.StatusDeactivated:
+		delay := time.Now().Sub(status.ProvisioningStatus.EarliestAttemptAt)
+		if delay > 0 {
+			klog.V(2).Infof("Retrying validation for Route %s got rate limited, next attempt in %v", key, delay)
+			rc.queue.AddAfter(key, delay)
+			return rc.updateStatus(routeReadOnly, status)
+		}
+
+		status.ProvisioningStatus.OrderURI = ""
+		fallthrough
+
+	default:
+		if len(status.ProvisioningStatus.OrderURI) == 0 {
+			order, err := acmeClient.AuthorizeOrder(ctx, acme.DomainIDs(domain))
+			if err != nil {
+				return err
+			}
+			klog.V(1).Infof("Created Order %q for Route %q", order.URI, key)
+
+			// We need to store the order URI immediately to prevent loosing it on error.
+			// Updating the route will make it requeue.
+			status.ProvisioningStatus.StartedAt = time.Now()
+			status.ProvisioningStatus.OrderURI = order.URI
+			return rc.updateStatus(routeReadOnly, status)
+		}
 	}
 
-	// Clear stuck provisioning
-	if time.Now().After(status.ProvisioningStatus.StartedAt.Add(rc.orderTimeout)) {
-		klog.Warningf("Route %q: Clearing stuck order %q", key, status.ProvisioningStatus.OrderUri)
-		status.ProvisioningStatus = nil
-		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
-	}
-
-	order, err := acmeClient.GetOrder(ctx, status.ProvisioningStatus.OrderUri)
+	order, err := acmeClient.GetOrder(ctx, status.ProvisioningStatus.OrderURI)
 	if err != nil {
 		acmeErr, ok := err.(*acme.Error)
 		if !ok || acmeErr.StatusCode != http.StatusNotFound {
@@ -515,13 +600,14 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 		}
 
 		// The order URI doesn't exist. Delete OrderUri and update the status.
-		klog.Warningf("Route %q: Found invalid OrderURI %q, removing it.", key, status.ProvisioningStatus.OrderUri)
-		status.ProvisioningStatus.OrderUri = ""
-		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+		klog.Warningf("Route %q: Found invalid OrderURI %q, removing it.", key, status.ProvisioningStatus.OrderURI)
+		status.ProvisioningStatus.OrderURI = ""
+		return rc.updateStatus(routeReadOnly, status)
 	}
 	// TODO: acme or golang should fill in the value
-	order.URI = status.ProvisioningStatus.OrderUri
+	order.URI = status.ProvisioningStatus.OrderURI
 
+	previousOrderStatus := status.ProvisioningStatus.OrderStatus
 	status.ProvisioningStatus.OrderStatus = order.Status
 
 	klog.V(4).Infof("Route %q: Order %q is in %q state", key, order.URI, order.Status)
@@ -531,8 +617,8 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 		// Satisfy all pending authorizations.
 		klog.V(4).Infof("Route %q: Order %q contains %d authorization(s)", key, order.URI, len(order.AuthzURLs))
 
-		for _, authzUrl := range order.AuthzURLs {
-			authz, err := acmeClient.GetAuthorization(ctx, authzUrl)
+		for _, authzURL := range order.AuthzURLs {
+			authz, err := acmeClient.GetAuthorization(ctx, authzURL)
 			if err != nil {
 				return err
 			}
@@ -568,9 +654,8 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 
 			switch challenge.Status {
 			case acme.StatusPending:
-				id := routeReadOnly.Name + ":" + order.URI + ":" + authzUrl + ":" + challenge.URI
+				id := getID(routeReadOnly.Name, order.URI, authzURL, challenge.URI)
 				tmpName := getTemporaryName(id)
-				klog.Infof("id: %q, tmpName: %q", id, tmpName)
 
 				challengePath := acmeClient.HTTP01ChallengePath(challenge.Token)
 				challengeResponse, err := acmeClient.HTTP01ChallengeResponse(challenge.Token)
@@ -598,11 +683,18 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 					desiredExposerRoute.Annotations = map[string]string{}
 				}
 				desiredExposerRoute.Annotations[api.AcmeExposerId] = id
+				desiredExposerRoute.Annotations[api.AcmeExposerKey] = key
 				if desiredExposerRoute.Labels == nil {
 					desiredExposerRoute.Labels = map[string]string{}
 				}
 				desiredExposerRoute.Labels[api.AcmeTemporaryLabel] = "true"
+				desiredExposerRoute.Labels[api.AcmeExposerUID] = string(routeReadOnly.UID)
 				desiredExposerRoute.Spec.Path = acmeClient.HTTP01ChallengePath(challenge.Token)
+				desiredExposerRoute.Spec.Port = nil
+				desiredExposerRoute.Spec.TLS = &routev1.TLSConfig{
+					Termination:                   "edge",
+					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyAllow,
+				}
 				desiredExposerRoute.Spec.To = routev1.RouteTargetReference{
 					Kind: "Service",
 					Name: tmpName,
@@ -652,10 +744,12 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 						Name:            tmpName,
 						OwnerReferences: []metav1.OwnerReference{ownerRefToExposerRoute},
 						Annotations: map[string]string{
-							api.AcmeExposerId: id,
+							api.AcmeExposerId:  id,
+							api.AcmeExposerKey: key,
 						},
 						Labels: map[string]string{
 							api.AcmeTemporaryLabel: "true",
+							api.AcmeExposerUID:     string(routeReadOnly.UID),
 						},
 					},
 					StringData: map[string]string{
@@ -703,10 +797,12 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 						Name:            tmpName,
 						OwnerReferences: []metav1.OwnerReference{ownerRefToExposerRoute},
 						Annotations: map[string]string{
-							api.AcmeExposerId: id,
+							api.AcmeExposerId:  id,
+							api.AcmeExposerKey: key,
 						},
 						Labels: map[string]string{
 							api.AcmeTemporaryLabel: "true",
+							api.AcmeExposerUID:     string(routeReadOnly.UID),
 						},
 					},
 					Spec: appsv1.ReplicaSetSpec{
@@ -726,6 +822,13 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 										},
 										Args: []string{
 											"--response-file=/etc/openshift-acme-exposer/" + ExposerFileKey,
+										},
+										Ports: []corev1.ContainerPort{
+											{
+												Name:          "http",
+												Protocol:      corev1.ProtocolTCP,
+												ContainerPort: 5000,
+											},
 										},
 										VolumeMounts: []corev1.VolumeMount{
 											{
@@ -784,10 +887,12 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 						Name:            tmpName,
 						OwnerReferences: []metav1.OwnerReference{ownerRefToExposerRoute},
 						Annotations: map[string]string{
-							api.AcmeExposerId: id,
+							api.AcmeExposerId:  id,
+							api.AcmeExposerKey: key,
 						},
 						Labels: map[string]string{
 							api.AcmeTemporaryLabel: "true",
+							api.AcmeExposerUID:     string(routeReadOnly.UID),
 						},
 					},
 					Spec: corev1.ServiceSpec{
@@ -795,10 +900,10 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 						Type:     corev1.ServiceTypeClusterIP,
 						Ports: []corev1.ServicePort{
 							{
-								Name:     "http",
-								Protocol: corev1.ProtocolTCP,
-								Port:     5000,
-								// TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: 5000},
+								Name:       "http",
+								Protocol:   corev1.ProtocolTCP,
+								Port:       80,
+								TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: 5000},
 							},
 						},
 					},
@@ -829,17 +934,31 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 					return fmt.Errorf("exposer service %s/%s id missmatch: expected %q, got %q", exposerRoute.Namespace, exposerRoute.Name, id, exposerServiceId)
 				}
 
+				// TODO: id admitted=false we should stop trying and report event
+				if !routeutil.IsAdmitted(exposerRoute) {
+					klog.V(4).Infof("exposer Route %s/%s isn't admitted yet", exposerRoute.Namespace, exposerRoute.Name)
+					rc.queue.AddAfter(key, 15*time.Second) // FIXME: set up event handlers
+					break
+				}
+
 				// TODO: wait for pods to run and report into status, requeue
 				// For now, the server is bound to retry the verification by RFC8555
 				// so on happy path there shouldn't be issues. But pods can get stuck
 				// on scheduling, quota, resources, ... and we want to know why the validation fails.
 				if exposerRS.Status.ObservedGeneration != exposerRS.Generation ||
 					exposerRS.Status.AvailableReplicas != exposerRS.Status.Replicas {
-					// TODO: make this a graceful backoff
-					// TODO: dump conditions so we log the reason
-					// TODO: fire event if this is the case over a long period of time
-					//  	 so user has a chance of knowing he hit quota or other issue
-					return fmt.Errorf("exposer ReplicaSet %s/%s isn't available", exposerRS.Namespace, exposerRS.Name)
+					klog.V(4).Infof("exposer ReplicaSet %s/%s isn't available yet", exposerRS.Namespace, exposerRS.Name)
+					rc.queue.AddAfter(key, 15*time.Second) // FIXME: set up event handlers
+					break
+				}
+
+				url := "http://" + domain + challengePath
+				err = controllerutils.ValidateExposedToken(url, challengeResponse)
+				if err != nil {
+					klog.Infof("Can't self validate exposed token before accepting the challenge: %v", err)
+					// We are waiting for external event, make sure we requeue
+					rc.queue.AddAfter(key, 15*time.Second)
+					break
 				}
 
 				_, err = acmeClient.Accept(ctx, challenge)
@@ -849,8 +968,7 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 				klog.V(2).Infof("Accepted challenge for Route %s.", key)
 
 				// We are waiting for external event, make sure we requeue
-				// TODO: backoff
-				rc.queue.AddAfter(key, 5*time.Second)
+				rc.queue.AddAfter(key, 15*time.Second)
 
 			case acme.StatusProcessing, acme.StatusValid, acme.StatusInvalid:
 				// These states will manifest into global order state over time.
@@ -858,20 +976,15 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 				// We could possibly report events for those but is seems too fine grained for now.
 
 				// We are waiting for external event, make sure we requeue
-				// TODO: backoff
-				rc.queue.AddAfter(key, 5*time.Second)
-				continue
+				rc.queue.AddAfter(key, 15*time.Second)
 
 			default:
 				return fmt.Errorf("route %q: order %q: authz %q: invalid status %q for challenge %q", key, order.URI, authz.URI, challenge.Status, challenge.URI)
 			}
 		}
 
-		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+		return rc.updateStatus(routeReadOnly, status)
 
-	case acme.StatusValid:
-		// FIXME: should be separate step after acme.StatusReady - needs fixing golang acme lib
-		fallthrough
 	case acme.StatusReady:
 		klog.V(3).Infof("Route %q: Order %q successfully validated", key, order.URI)
 		template := x509.CertificateRequest{
@@ -880,7 +993,6 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 			},
 		}
 		template.DNSNames = append(template.DNSNames, routeReadOnly.Spec.Host)
-		klog.V(4).Infof("Route %q: Order %q: CSR template: %#v", key, order, template)
 		privateKey, err := rsa.GenerateKey(cryptorand.Reader, 4096)
 		if err != nil {
 			return fmt.Errorf("failed to generate RSA key: %v", err)
@@ -890,14 +1002,13 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create certificate request: %v", err)
 		}
-		klog.V(4).Infof("Route %q: Order %q: CSR: %#v", key, order.URI, string(csr))
 
 		// Send CSR
 		// FIXME: Unfortunately golang also waits in this method for the cert creation
 		//  although that should be asynchronous. Requires fixing golang lib. (The helpers used are private.)
 		der, certUrl, err := acmeClient.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
 		if err != nil {
-			return err
+			return fmt.Errorf("can't create cert order: %w", err)
 		}
 
 		klog.V(4).Infof("Route %q: Order %q: Certificate available at %q", key, order.URI, certUrl)
@@ -923,9 +1034,7 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 			return fmt.Errorf("can't update route %s/%s with new certificates: %v", routeReadOnly.Namespace, route.Name, err)
 		}
 
-		status.ProvisioningStatus = nil
-
-		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+		return rc.updateStatus(routeReadOnly, status)
 
 	case acme.StatusProcessing:
 		// TODO: backoff but capped at some reasonable time
@@ -933,16 +1042,64 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 
 		klog.V(4).Infof("Route %q: Order %q: Waiting to be validated by ACME server", key, order)
 
-		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+		return rc.updateStatus(routeReadOnly, status)
+
+	case acme.StatusValid:
+		// Unfortunately the golang acme lib actively waits in 'CreateOrderCert'
+		// so we can't take the appropriate asynchronous action here.
+		err = rc.CleanupExposerObjects(routeReadOnly)
+		if err != nil {
+			klog.Errorf("Can't cleanup exposer objects: %v", err)
+		}
+		return rc.updateStatus(routeReadOnly, status)
 
 	case acme.StatusInvalid:
-		rc.recorder.Eventf(routeReadOnly, corev1.EventTypeWarning, "AcmeFailedOrder", "Order %q for domain %q failed: %v", routeReadOnly.Spec.Host, order.Error)
+		rc.recorder.Eventf(routeReadOnly, corev1.EventTypeWarning, "AcmeFailedOrder", "Order %q for domain %q failed: %v", order.URI, routeReadOnly.Spec.Host, order.Error)
 
-		return rc.updateStatus(routeReadOnly.DeepCopy(), status)
+		if status.ProvisioningStatus.OrderStatus != previousOrderStatus {
+			status.ProvisioningStatus.Failures += 1
+		}
+		err = rc.CleanupExposerObjects(routeReadOnly)
+		if err != nil {
+			klog.Errorf("Can't cleanup exposer objects: %v", err)
+		}
+		return rc.updateStatus(routeReadOnly, status)
+
+	case acme.StatusExpired, acme.StatusRevoked, acme.StatusDeactivated:
+		if status.ProvisioningStatus.OrderStatus != previousOrderStatus {
+			status.ProvisioningStatus.Failures += 1
+		}
+		err = rc.CleanupExposerObjects(routeReadOnly)
+		if err != nil {
+			klog.Errorf("Can't cleanup exposer objects: %v", err)
+		}
+		return rc.updateStatus(routeReadOnly, status)
 
 	default:
 		return fmt.Errorf("route %q: invalid new order status %q; order URL: %q", key, order.Status, order.URI)
 	}
+}
+
+func (rc *RouteController) CleanupExposerObjects(route *routev1.Route) error {
+	var gracePeriod int64 = 0
+	propagationPolicy := metav1.DeletePropagationBackground
+	klog.V(3).Infof("Cleaning up temporary exposer for Route %s/%s (UID=%s)", route.Namespace, route.Name, route.UID)
+	err := rc.routeClient.RouteV1().Routes(route.Namespace).DeleteCollection(
+		&metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+			PropagationPolicy:  &propagationPolicy,
+		},
+		metav1.ListOptions{
+			LabelSelector: labels.SelectorFromValidatedSet(labels.Set{
+				api.AcmeExposerUID: string(route.UID),
+			}).String(),
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // FIXME: move to its own sync loop
@@ -1044,47 +1201,22 @@ func (rc *RouteController) syncSecret(routeReadOnly *routev1.Route) error {
 }
 */
 
-// handleErr checks if an error happened and makes sure we will retry later.
-func (rc *RouteController) handleErr(err error, key interface{}) {
-	if err == nil {
-		// Forget about the #AddRateLimited history of the key on every successful synchronization.
-		// This ensures that future processing of updates for this key is not delayed because of
-		// an outdated error history.
-		rc.queue.Forget(key)
-		return
-	}
-
-	if rc.queue.NumRequeues(key) < MaxRetries {
-		klog.Infof("Error syncing Route %v: %v", key, err)
-
-		// Re-enqueue the key rate limited. Based on the rate limiter on the
-		// queue and the re-enqueue history, the key will be processed later again.
-		rc.queue.AddRateLimited(key)
-		return
-	}
-
-	rc.queue.Forget(key)
-	rc.queue.AddAfter(key, 24*time.Hour) // Try next day, until we have proper rate limiting for ACME requests
-	// Report to an external entity that, even after several retries, we could not successfully process this key
-	utilruntime.HandleError(err)
-	klog.Infof("Dropping Route %q out of the queue: %v", key, err)
-}
-
 func (rc *RouteController) processNextItem(ctx context.Context) bool {
-	// Wait until there is a new item in the working queue
 	key, quit := rc.queue.Get()
 	if quit {
 		return false
 	}
-	// Tell the queue that we are done with processing this key. This unblocks the key for other workers
-	// This allows safe parallel processing because two Routes with the same key are never processed in
-	// parallel.
 	defer rc.queue.Done(key)
 
-	// Invoke the method containing the business logic
 	err := rc.sync(ctx, key.(string))
-	// Handle the error if something went wrong during the execution of the business logic
-	rc.handleErr(err, key)
+	if err == nil {
+		rc.queue.Forget(key)
+		return true
+	}
+
+	utilruntime.HandleError(fmt.Errorf("%v failed with : %v", key, err))
+	rc.queue.AddRateLimited(key)
+
 	return true
 }
 
@@ -1125,4 +1257,23 @@ func (rc *RouteController) Run(ctx context.Context, workers int) {
 func getTemporaryName(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return fmt.Sprintf("exposer-%s", strings.ToLower(base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])))
+}
+
+func getID(routeName, orderURI, authzURL, challengeURI string) string {
+	return routeName + ":" + orderURI + ":" + authzURL + ":" + challengeURI
+}
+
+func setStatus(obj *metav1.ObjectMeta, status *api.Status) error {
+	status.ObservedGeneration = obj.Generation
+
+	// TODO: sign the status
+
+	bytes, err := yaml.Marshal(status)
+	if err != nil {
+		return fmt.Errorf("can't encode status annotation: %v", err)
+	}
+
+	metav1.SetMetaDataAnnotation(obj, api.AcmeStatusAnnotation, string(bytes))
+
+	return nil
 }

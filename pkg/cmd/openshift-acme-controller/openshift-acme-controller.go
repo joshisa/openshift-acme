@@ -25,6 +25,7 @@ import (
 
 	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
 
+	"github.com/tnozicka/openshift-acme/pkg/api"
 	"github.com/tnozicka/openshift-acme/pkg/cmd/genericclioptions"
 	cmdutil "github.com/tnozicka/openshift-acme/pkg/cmd/util"
 	acmeissuer "github.com/tnozicka/openshift-acme/pkg/controller/issuer/acme"
@@ -37,12 +38,15 @@ import (
 type Options struct {
 	genericclioptions.IOStreams
 
+	Annotation                  string
 	Workers                     int
 	Kubeconfig                  string
 	ControllerNamespace         string
 	LeaderelectionLeaseDuration time.Duration
 	LeaderelectionRenewDeadline time.Duration
 	LeaderelectionRetryPeriod   time.Duration
+	CertOrderBackoffInitial     time.Duration
+	CertOrderBackoffMax         time.Duration
 	Namespaces                  []string
 	AcmeOrderTimeout            time.Duration
 
@@ -62,8 +66,11 @@ func NewOptions(streams genericclioptions.IOStreams) *Options {
 		LeaderelectionLeaseDuration: 60 * time.Second,
 		LeaderelectionRenewDeadline: 35 * time.Second,
 		LeaderelectionRetryPeriod:   10 * time.Second,
+		CertOrderBackoffInitial:     5 * time.Minute,
+		CertOrderBackoffMax:         24 * time.Hour,
 
-		AcmeOrderTimeout: 5 * time.Minute,
+		Annotation:       api.DefaultTlsAcmeAnnotation,
+		AcmeOrderTimeout: 15 * time.Minute,
 
 		ExposerImage: "",
 
@@ -113,6 +120,7 @@ func NewOpenshiftAcmeControllerCommand(streams genericclioptions.IOStreams) *cob
 
 	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
+	rootCmd.PersistentFlags().StringVarP(&o.Annotation, "annotation", "", o.Annotation, "The annotation marking Routes this controller should manage.")
 	rootCmd.PersistentFlags().IntVarP(&o.Workers, "workers", "", o.Workers, "Number of workers to run")
 	rootCmd.PersistentFlags().StringVarP(&o.Kubeconfig, "kubeconfig", "", o.Kubeconfig, "Path to the kubeconfig file")
 	rootCmd.PersistentFlags().StringVarP(&o.ControllerNamespace, "controller-namespace", "", o.ControllerNamespace, "Namespace where the controller is running. Autodetected if run inside a cluster.")
@@ -121,6 +129,9 @@ func NewOpenshiftAcmeControllerCommand(streams genericclioptions.IOStreams) *cob
 	rootCmd.PersistentFlags().DurationVar(&o.LeaderelectionLeaseDuration, "leaderelection-lease-duration", o.LeaderelectionLeaseDuration, "LeaseDuration is the duration that non-leader candidates will wait to force acquire leadership.")
 	rootCmd.PersistentFlags().DurationVar(&o.LeaderelectionRenewDeadline, "leaderelection-renew-deadline", o.LeaderelectionRenewDeadline, "RenewDeadline is the duration that the acting master will retry refreshing leadership before giving up.")
 	rootCmd.PersistentFlags().DurationVar(&o.LeaderelectionRetryPeriod, "leaderelection-retry-period", o.LeaderelectionRetryPeriod, "RetryPeriod is the duration the LeaderElector clients should wait between tries of actions.")
+
+	rootCmd.PersistentFlags().DurationVar(&o.CertOrderBackoffInitial, "cert-order-backoff-initial", o.CertOrderBackoffInitial, "Initial value for the exponential backoff guarding retrying failed orders.")
+	rootCmd.PersistentFlags().DurationVar(&o.CertOrderBackoffMax, "cert-order-backoff-max", o.CertOrderBackoffMax, "The upper limit for for the exponential backoff guarding retrying failed orders.")
 
 	rootCmd.PersistentFlags().StringVarP(&o.ExposerImage, "exposer-image", "", o.ExposerImage, "Image to use for exposing tokens for http based validation. (In standard configuration this contains openshift-acme-exposer binary, but the API is generic.)")
 
@@ -325,7 +336,7 @@ func (o *Options) Run(cmd *cobra.Command, streams genericclioptions.IOStreams) e
 
 	ac := acmeissuer.NewAccountController(o.kubeClient, kubeInformersForNamespaces)
 
-	rc := routecontroller.NewRouteController(o.AcmeOrderTimeout, o.ExposerImage, o.ControllerNamespace, o.kubeClient, kubeInformersForNamespaces, o.routeClient, routeInformersForNamespaces)
+	rc := routecontroller.NewRouteController(o.Annotation, o.CertOrderBackoffInitial, o.CertOrderBackoffMax, o.ExposerImage, o.ControllerNamespace, o.kubeClient, kubeInformersForNamespaces, o.routeClient, routeInformersForNamespaces)
 
 	kubeInformersForNamespaces.Start(stopCh)
 	routeInformersForNamespaces.Start(stopCh)

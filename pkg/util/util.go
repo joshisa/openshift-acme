@@ -17,15 +17,23 @@ import (
 	routeutil "github.com/tnozicka/openshift-acme/pkg/route"
 )
 
-func IsManaged(obj metav1.Object) bool {
-	v, ok := obj.GetAnnotations()[api.TlsAcmeAnnotation]
+func IsTemporary(obj metav1.Object) bool {
+	v, ok := obj.GetLabels()[api.AcmeTemporaryLabel]
+	if ok && v == "true" {
+		return true
+	}
+
+	return false
+}
+
+func IsManaged(obj metav1.Object, key string) bool {
+	v, ok := obj.GetAnnotations()[key]
 	if !ok || v != "true" {
 		return false
 	}
 
 	// ignore temporary routes that inherit the TlsAcmeAnnotation from the real route
-	v, ok = obj.GetLabels()[api.AcmeTemporaryLabel]
-	if ok && v == "true" {
+	if IsTemporary(obj) {
 		return false
 	}
 

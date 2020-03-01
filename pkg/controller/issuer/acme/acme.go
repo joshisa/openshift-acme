@@ -174,7 +174,6 @@ func (ac *AccountController) addConfigMap(obj interface{}) {
 	cm := obj.(*corev1.ConfigMap)
 
 	if !api.AccountLabelSet.AsSelector().Matches(labels.Set(cm.Labels)) {
-		klog.V(5).Infof("Skipping ConfigMap %s/%s UID=%s RV=%s", cm.Namespace, cm.Name, cm.UID, cm.ResourceVersion)
 		return
 	}
 
@@ -322,7 +321,7 @@ func (ac *AccountController) sync(ctx context.Context, key string) error {
 	}
 
 	client := &acme.Client{
-		DirectoryURL: acmeIssuer.DirectoryUrl,
+		DirectoryURL: acmeIssuer.DirectoryURL,
 		UserAgent:    "github.com/tnozicka/openshift-acme",
 	}
 
@@ -408,7 +407,7 @@ func (ac *AccountController) sync(ctx context.Context, key string) error {
 		if err != nil {
 			return err
 		}
-		klog.V(2).Infof("Refreshed account object %s/%s with data from ACME ", cmReadOnly.Namespace, cmReadOnly.Name, account)
+		klog.V(2).Infof("Refreshed account object %s/%s with data from ACME", cmReadOnly.Namespace, cmReadOnly.Name)
 	}
 
 	if account != nil {

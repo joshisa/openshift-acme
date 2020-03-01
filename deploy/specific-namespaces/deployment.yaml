@@ -5,13 +5,14 @@ metadata:
   labels:
     app: openshift-acme
   annotations:
+    image.openshift.io/triggers: '[{"from":{"kind":"ImageStreamTag","name":"openshift-acme:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"openshift-acme\")].image"}]'
 spec:
   selector:
     matchLabels:
       app: openshift-acme
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
   template:
     metadata:
       labels:
@@ -20,10 +21,8 @@ spec:
       serviceAccountName: openshift-acme
       containers:
       - name: openshift-acme
-        image: "quay.io/tnozicka/openshift-acme:controller"
-        args:
-        - "--loglevel=2"
+        image: " "
         imagePullPolicy: Always
-        env:
-        - name: OPENSHIFT_ACME_EXPOSER_IMAGE
-          value: "quay.io/tnozicka/openshift-acme:exposer"
+        args:
+        - --loglevel=4
+        - --namespace=openshift-acme

@@ -2,10 +2,13 @@ package routes
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
+	"golang.org/x/crypto/acme"
+
 	routev1 "github.com/openshift/api/route/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -13,9 +16,13 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	watchtools "k8s.io/client-go/tools/watch"
+	"k8s.io/klog"
 
 	"github.com/tnozicka/openshift-acme/pkg/api"
 	"github.com/tnozicka/openshift-acme/pkg/cert"
+	"github.com/tnozicka/openshift-acme/pkg/controllerutils"
+	"github.com/tnozicka/openshift-acme/pkg/helpers"
+	kubeinformers "github.com/tnozicka/openshift-acme/pkg/machinery/informers/kube"
 	"github.com/tnozicka/openshift-acme/pkg/util"
 	"github.com/tnozicka/openshift-acme/test/e2e/framework"
 	exutil "github.com/tnozicka/openshift-acme/test/e2e/openshift/util"
@@ -34,26 +41,45 @@ func DeleteACMEAccountIfRequested(f *framework.Framework, notFoundOK bool) error
 	}
 	name := "acme-account"
 
-	// We need to deactivate account first because controller uses informer and might have it cached
-	secret, err := f.KubeAdminClientSet().CoreV1().Secrets(namespace).Get(name, metav1.GetOptions{})
+	kubeInformersForNamespaces := kubeinformers.NewKubeInformersForNamespaces(f.KubeClientSet(), []string{"acme-controller"})
+	// Currently we only use the global issuer
+	// TODO: delete all issuer secrets
+	certIssuer, certIssuerSecret, err := controllerutils.IssuerForObject(metav1.ObjectMeta{Namespace: "acme-controller", Name: "dummy"}, "acme-controller", kubeInformersForNamespaces)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			if !notFoundOK {
-				return err
-			}
-		} else {
-			return err
-		}
+		return fmt.Errorf("can't get cert issuer: %w", err)
 	}
 
-	client, err := builder.BuildClientFromSecret(secret)
+	// We need to deactivate account first because controller uses informer and might have it cached
+
+	switch certIssuer.Type {
+	case api.CertIssuerTypeAcme:
+		break
+	default:
+		return fmt.Errorf("unsupported cert issuer type %q", certIssuer.Type)
+	}
+
+	acmeIssuer := certIssuer.AcmeCertIssuer
+	if acmeIssuer == nil {
+		return fmt.Errorf("ACME issuer is missing AcmeCertIssuer spec")
+	}
+
+	acmeClient := &acme.Client{
+		DirectoryURL: acmeIssuer.DirectoryURL,
+		UserAgent:    "github.com/tnozicka/openshift-acme",
+	}
+	klog.V(4).Infof("Using ACME client with DirectoryURL %q", acmeClient.DirectoryURL)
+
+	acmeClient.Key, err = helpers.PrivateKeyFromSecret(certIssuerSecret)
 	if err != nil {
 		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client.DeactivateAccount(ctx, client.Account)
+	err = acmeClient.DeactivateReg(ctx)
+	if err != nil {
+		return err
+	}
 
 	var grace int64 = 0
 	propagation := metav1.DeletePropagationForeground
@@ -321,8 +347,8 @@ var _ = g.Describe("Routes", func() {
 				TLS: &routev1.TLSConfig{
 					Termination:                   routev1.TLSTerminationEdge,
 					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyAllow,
-					Key:         string(certData.Key),
-					Certificate: string(certData.Crt),
+					Key:                           string(certData.Key),
+					Certificate:                   string(certData.Crt),
 				},
 			},
 		}
@@ -409,8 +435,8 @@ var _ = g.Describe("Routes", func() {
 				TLS: &routev1.TLSConfig{
 					Termination:                   routev1.TLSTerminationEdge,
 					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyAllow,
-					Key:         string(certData.Key),
-					Certificate: string(certData.Crt),
+					Key:                           string(certData.Key),
+					Certificate:                   string(certData.Crt),
 				},
 			},
 		}
