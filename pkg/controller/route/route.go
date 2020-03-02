@@ -19,6 +19,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/ghodss/yaml"
 	"golang.org/x/crypto/acme"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -500,19 +501,45 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 		return fmt.Errorf("can't get status: %v", err)
 	}
 
-	if status.ProvisioningStatus == nil {
-		reason, err := needsCertKey(time.Now(), routeReadOnly)
-		if err != nil {
-			return err
+	// TODO: Update status values e.g. for cert validity, next planned update range
+	backoff := time.Duration(0)
+	for i := 0; i < status.ProvisioningStatus.Failures; i++ {
+		backoff *= rc.certOrderBackoffInitial
+		if backoff >= rc.certOrderBackoffMax {
+			backoff = rc.certOrderBackoffMax
+			break
 		}
+	}
+	status.ProvisioningStatus.EarliestAttemptAt = status.ProvisioningStatus.StartedAt.Add(backoff)
 
-		if len(reason) == 0 {
-			// Not eligible for renewal
-			klog.V(4).Infof("Route %q doesn't need new certificate", key)
+	reason, err := needsCertKey(time.Now(), routeReadOnly)
+	if err != nil {
+		return err
+	}
+
+	if len(reason) == 0 {
+		klog.V(4).Infof("Route %q doesn't needs new certificate.", key)
+		return rc.updateStatus(routeReadOnly, status)
+	}
+
+	klog.V(2).Infof("Route %q needs new certificate: %v", key, reason)
+
+	// We need new cert, clean the previous order if present
+	switch status.ProvisioningStatus.OrderStatus {
+	case "", acme.StatusValid:
+		status.ProvisioningStatus.OrderURI = ""
+		status.ProvisioningStatus.OrderStatus = ""
+
+	case acme.StatusInvalid, acme.StatusExpired, acme.StatusRevoked, acme.StatusDeactivated:
+		delay := time.Now().Sub(status.ProvisioningStatus.EarliestAttemptAt)
+		if delay > 0 {
+			klog.V(2).Infof("Retrying validation for Route %s got rate limited, next attempt in %v", key, delay)
+			rc.queue.AddAfter(key, delay)
 			return rc.updateStatus(routeReadOnly, status)
 		}
 
-		klog.V(1).Infof("Route %q needs new certificate: %v", key, reason)
+		status.ProvisioningStatus.OrderURI = ""
+		status.ProvisioningStatus.OrderStatus = ""
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), AcmeTimeout)
@@ -547,49 +574,20 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 
 	domain := routeReadOnly.Spec.Host
 
-	if status.ProvisioningStatus == nil {
-		status.ProvisioningStatus = &api.CertProvisioningStatus{}
-	}
-
-	backoff := time.Duration(0)
-	for i := 0; i < status.ProvisioningStatus.Failures; i++ {
-		backoff *= rc.certOrderBackoffInitial
-		if backoff >= rc.certOrderBackoffMax {
-			backoff = rc.certOrderBackoffMax
-			break
+	if len(status.ProvisioningStatus.OrderURI) == 0 {
+		order, err := acmeClient.AuthorizeOrder(ctx, acme.DomainIDs(domain))
+		if err != nil {
+			return err
 		}
-	}
-	status.ProvisioningStatus.EarliestAttemptAt = status.ProvisioningStatus.StartedAt.Add(backoff)
+		// TODO: convert into event
+		klog.V(1).Infof("Created Order %q for Route %q", order.URI, key)
 
-	switch status.ProvisioningStatus.OrderStatus {
-	case acme.StatusValid:
-		break
-
-	case acme.StatusInvalid, acme.StatusExpired, acme.StatusRevoked, acme.StatusDeactivated:
-		delay := time.Now().Sub(status.ProvisioningStatus.EarliestAttemptAt)
-		if delay > 0 {
-			klog.V(2).Infof("Retrying validation for Route %s got rate limited, next attempt in %v", key, delay)
-			rc.queue.AddAfter(key, delay)
-			return rc.updateStatus(routeReadOnly, status)
-		}
-
-		status.ProvisioningStatus.OrderURI = ""
-		fallthrough
-
-	default:
-		if len(status.ProvisioningStatus.OrderURI) == 0 {
-			order, err := acmeClient.AuthorizeOrder(ctx, acme.DomainIDs(domain))
-			if err != nil {
-				return err
-			}
-			klog.V(1).Infof("Created Order %q for Route %q", order.URI, key)
-
-			// We need to store the order URI immediately to prevent loosing it on error.
-			// Updating the route will make it requeue.
-			status.ProvisioningStatus.StartedAt = time.Now()
-			status.ProvisioningStatus.OrderURI = order.URI
-			return rc.updateStatus(routeReadOnly, status)
-		}
+		// We need to store the order URI immediately to prevent loosing it on error.
+		// Updating the route will make it requeue.
+		status.ProvisioningStatus.StartedAt = time.Now()
+		status.ProvisioningStatus.OrderURI = order.URI
+		status.ProvisioningStatus.OrderStatus = order.Status
+		return rc.updateStatus(routeReadOnly, status)
 	}
 
 	order, err := acmeClient.GetOrder(ctx, status.ProvisioningStatus.OrderURI)
@@ -837,6 +835,16 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 												MountPath: "/etc/openshift-acme-exposer",
 											},
 										},
+										Resources: corev1.ResourceRequirements{
+											Requests: corev1.ResourceList{
+												corev1.ResourceCPU:    *resource.NewMilliQuantity(5, resource.DecimalSI),
+												corev1.ResourceMemory: *resource.NewQuantity(50*(1024*1024), resource.BinarySI),
+											},
+											Limits: corev1.ResourceList{
+												corev1.ResourceCPU:    *resource.NewMilliQuantity(100, resource.DecimalSI),
+												corev1.ResourceMemory: *resource.NewQuantity(50*(1024*1024), resource.BinarySI),
+											},
+										},
 									},
 								},
 								Volumes: []corev1.Volume{
@@ -985,7 +993,19 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 
 		return rc.updateStatus(routeReadOnly, status)
 
+	case acme.StatusProcessing:
+		// TODO: backoff but capped at some reasonable time
+		rc.queue.AddAfter(routeReadOnly, 15*time.Second)
+
+		klog.V(4).Infof("Route %q: Order %q: Waiting to be validated by ACME server", key, order)
+
+		return rc.updateStatus(routeReadOnly, status)
+
 	case acme.StatusReady:
+		// TODO: fix the golang acme lib
+		// Unfortunately the golang acme lib actively waits in 'CreateOrderCert'
+		// so we can't take the appropriate asynchronous action here.
+
 		klog.V(3).Infof("Route %q: Order %q successfully validated", key, order.URI)
 		template := x509.CertificateRequest{
 			Subject: pkix.Name{
@@ -1019,6 +1039,18 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 		}
 
 		route := routeReadOnly.DeepCopy()
+
+		// unfortunatly golang acmeClient.CreateOrderCert waits internally for transitioning state
+		// to valid and we need to reflect it in our state machine because we don't get back
+		// into the provisioning phase again after the certs are updated and valid.
+		status.ProvisioningStatus.OrderStatus = acme.StatusValid
+
+		// We are updating the route and to avoid conflicts later we will also update the status together
+		err = setStatus(&route.ObjectMeta, status)
+		if err != nil {
+			return fmt.Errorf("can't set status: %w", err)
+		}
+
 		if route.Spec.TLS == nil {
 			route.Spec.TLS = &routev1.TLSConfig{
 				// Defaults
@@ -1029,29 +1061,26 @@ func (rc *RouteController) sync(ctx context.Context, key string) error {
 		route.Spec.TLS.Key = string(certPemData.Key)
 		route.Spec.TLS.Certificate = string(certPemData.Crt)
 
+		// TODO: consider RetryOnConflict with rechecking the managed annotation
 		_, err = rc.routeClient.RouteV1().Routes(routeReadOnly.Namespace).Update(route)
 		if err != nil {
 			return fmt.Errorf("can't update route %s/%s with new certificates: %v", routeReadOnly.Namespace, route.Name, err)
 		}
 
-		return rc.updateStatus(routeReadOnly, status)
-
-	case acme.StatusProcessing:
-		// TODO: backoff but capped at some reasonable time
-		rc.queue.AddAfter(routeReadOnly, 15*time.Second)
-
-		klog.V(4).Infof("Route %q: Order %q: Waiting to be validated by ACME server", key, order)
-
-		return rc.updateStatus(routeReadOnly, status)
-
-	case acme.StatusValid:
-		// Unfortunately the golang acme lib actively waits in 'CreateOrderCert'
-		// so we can't take the appropriate asynchronous action here.
 		err = rc.CleanupExposerObjects(routeReadOnly)
 		if err != nil {
 			klog.Errorf("Can't cleanup exposer objects: %v", err)
 		}
-		return rc.updateStatus(routeReadOnly, status)
+
+		// We have already updated the status when updating the Route.
+		return nil
+
+	case acme.StatusValid:
+		// TODO: fix the golang acme lib
+		// Unfortunately the golang acme lib actively waits in 'CreateOrderCert'
+		// so we can't take the appropriate asynchronous action here.
+		// The logic is included in handling acme.StatusReady
+		return nil
 
 	case acme.StatusInvalid:
 		rc.recorder.Eventf(routeReadOnly, corev1.EventTypeWarning, "AcmeFailedOrder", "Order %q for domain %q failed: %v", order.URI, routeReadOnly.Spec.Host, order.Error)

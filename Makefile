@@ -16,7 +16,7 @@ TEST_FLAGS :=
 GO_ET_DOMAIN :=""
 
 # Include the library makefile
-include $(addprefix ./vendor/github.com/openshift/library-go/alpha-build-machinery/make/, \
+include $(addprefix ./vendor/github.com/openshift/build-machinery-go/make/, \
 	golang.mk \
 	targets/openshift/deps.mk \
 	targets/openshift/images.mk \
@@ -57,5 +57,10 @@ test-e2e-cluster-wide:
 .PHONY: test-e2e-cluster-wide
 
 test-e2e-single-namespace:
+	./hack/ci-run-e2e.sh single-namespace
+.PHONY: test-e2e-single-namespace
+
+test-e2e-specific-namespaces:
+# FIXME
 	./hack/ci-run-e2e.sh single-namespace
 .PHONY: test-e2e-single-namespace

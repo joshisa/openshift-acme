@@ -6,9 +6,15 @@ metadata:
     app: openshift-acme
 spec:
   tags:
-  - name: latest
+  - name: controller
     from:
       kind: DockerImage
-      name: docker.io/tnozicka/openshift-acme:latest
+      name: docker.io/tnozicka/openshift-acme:controller
+    importPolicy:
+      scheduled: false
+  - name: exposer
+    from:
+      kind: DockerImage
+      name: docker.io/tnozicka/openshift-acme:exposer
     importPolicy:
       scheduled: false

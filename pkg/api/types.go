@@ -103,7 +103,7 @@ type Status struct {
 	CertificateMeta *CertificateMeta `json:"certificateMeta,omitempty"`
 
 	// provisioningStatus
-	ProvisioningStatus *CertProvisioningStatus `json:"provisioningStatus,omitempty"`
+	ProvisioningStatus CertProvisioningStatus `json:"provisioningStatus"`
 
 	// signature (internal) holds the cryptographic signature controller uses for internal check
 	// that prevents messing with status filed and injection e.g. malicious URLs.

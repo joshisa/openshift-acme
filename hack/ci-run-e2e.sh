@@ -70,7 +70,7 @@ oc tag registry.svc.ci.openshift.org/"${OPENSHIFT_BUILD_NAMESPACE}"/pipeline:ope
 
 case $1 in
 "cluster-wide")
-    oc create -fdeploy/letsencrypt-staging/cluster-wide/{clusterrole,serviceaccount,deployment}.yaml
+    oc create -fdeploy/cluster-wide/{clusterrole,serviceaccount,deployment,issuer-letsencrypt-staging}.yaml
 
     oc adm policy add-cluster-role-to-user openshift-acme -z openshift-acme
 
@@ -80,7 +80,7 @@ case $1 in
     ;;
 
 "single-namespace")
-    oc --as=developer create -fdeploy/letsencrypt-staging/single-namespace/{role,serviceaccount,deployment}.yaml
+    oc --as=developer create -fdeploy/single-namespace/{role,serviceaccount,deployment,issuer-letsencrypt-staging}.yaml
 
     oc --as=developer policy add-role-to-user openshift-acme --role-namespace="${PROJECT}" -z openshift-acme
 

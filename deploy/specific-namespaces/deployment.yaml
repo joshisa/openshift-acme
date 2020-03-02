@@ -24,5 +24,6 @@ spec:
         image: " "
         imagePullPolicy: Always
         args:
-        - --loglevel=4
         - --namespace=openshift-acme
+        - --exposer-image="FIXME"
+        - --loglevel=4

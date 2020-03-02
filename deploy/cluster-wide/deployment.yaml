@@ -24,4 +24,5 @@ spec:
         image: " "
         imagePullPolicy: Always
         args:
+        - --exposer-image="FIXME"
         - --loglevel=4
