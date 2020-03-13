@@ -1,2 +1,4 @@
-26a27
->         - --namespace=openshift-acme
+7d6
+<   annotations:
+27a27
+>         - --namespace=acme-controller

@@ -11,93 +11,66 @@ case $1 in
     exit 1
 esac
 
+ARTIFACT_DIR=${ARTIFACT_DIR:-}
+
 function teardown {
-    if [ -n "${ARTIFACT_DIR}" ]; then
+    if [[ -n "${ARTIFACT_DIR}" ]]; then
         oc logs -n "${PROJECT}" deploy/openshift-acme > "${ARTIFACT_DIR}"/openshift-acme_deploy.log || true
     fi
 }
 trap teardown ERR EXIT
 
-# The default routes are longer then LE max length of 64 character, we need to create shorter domain
-oc new-project test
-oc create route edge test --service=none --port=80
-
-router_canonical_hostname=""
-until [[ ${router_canonical_hostname} != "" ]]; do
-    router_canonical_hostname=$( oc get route test -o go-template --template="{{ or (index .status.ingress 0).routerCanonicalHostname \"\" }}" || true );
-done
-
-domain_length=$( echo $(( $( echo ${router_canonical_hostname} | wc -c ) + 1 )) )
-echo domain_length: ${domain_length}
-
-prefix_length=$( echo $(( 64 - ${domain_length} )) )
-(( ${prefix_length} > 0 ))
-
-prefix=$( cat /dev/urandom | tr -dc 'a-z0-9' | fold -w ${prefix_length} | head -n 1 || [[ $? == 141 ]] )
-
-export TEST_DOMAIN=${prefix}.${router_canonical_hostname}
-(( ${prefix_length} <= 64 ))
-
+TEST_DOMAIN={TEST_DOMAIN:-""}
+export TEST_DOMAIN
 
 # Deploy
 PROJECT=${PROJECT:-acme-controller}
-oc new-project "${PROJECT}"
+oc new-project "${PROJECT}" || true
+
 
 case $1 in
 "cluster-wide")
-    oc apply -fdeploy/letsencrypt-staging/cluster-wide/imagestream.yaml
+    export FIXED_NAMESPACE=""
     ;;
-
 "single-namespace")
     oc create user developer
     oc create clusterrolebinding developer --clusterrole=basic-user --user=developer
     oc adm policy add-role-to-user admin developer -n "${PROJECT}"
+    alias oc='oc --as developer'
     # perms sanity checks
-    oc --as developer auth can-i create clusterrole && exit 1
-    oc --as developer auth can-i create deployment -n "${PROJECT}"
-
-    oc --as developer apply -fdeploy/letsencrypt-staging/single-namespace/imagestream.yaml
+    oc auth can-i create clusterrole && exit 1
+    oc auth can-i create deployment -n "${PROJECT}"
+    export FIXED_NAMESPACE="${PROJECT}"
     ;;
-
 *)
     exit 1
 esac
 
-oc tag -d openshift-acme:controller
-oc tag -d openshift-acme:exposer
-oc tag registry.svc.ci.openshift.org/"${OPENSHIFT_BUILD_NAMESPACE}"/pipeline:openshift-acme-controller openshift-acme:controller
-oc tag registry.svc.ci.openshift.org/"${OPENSHIFT_BUILD_NAMESPACE}"/pipeline:openshift-acme-exposer openshift-acme:exposer
+oc apply -fdeploy/$1/{serviceaccount,issuer-letsencrypt-staging}.yaml
 
 case $1 in
 "cluster-wide")
-    oc create -fdeploy/cluster-wide/{clusterrole,serviceaccount,deployment,issuer-letsencrypt-staging}.yaml
-
     oc adm policy add-cluster-role-to-user openshift-acme -z openshift-acme
-
-    oc adm pod-network make-projects-global "${PROJECT}" || true
-
-    export FIXED_NAMESPACE=""
     ;;
-
 "single-namespace")
-    oc --as=developer create -fdeploy/single-namespace/{role,serviceaccount,deployment,issuer-letsencrypt-staging}.yaml
-
-    oc --as=developer policy add-role-to-user openshift-acme --role-namespace="${PROJECT}" -z openshift-acme
-
-    export FIXED_NAMESPACE="${PROJECT}"
+    oc policy add-role-to-user openshift-acme --role-namespace="${PROJECT}" -z openshift-acme
     ;;
-
 *)
     exit 1
 esac
+
+cat deploy/$1/deployment.yaml | \
+    sed -e "s~quay.io/tnozicka/openshift-acme:controller~registry.svc.ci.openshift.org/"${OPENSHIFT_BUILD_NAMESPACE}"/pipeline:openshift-acme-controller~" | \
+    sed -e 's~quay.io/tnozicka/openshift-acme:exposer~registry.svc.ci.openshift.org/"${OPENSHIFT_BUILD_NAMESPACE}"/pipeline:openshift-acme-exposer~' | \
+    grep -v -e 'quay.io' -e 'docker.io' | \
+   oc apply -f -
 
 
 # TODO: use subdomains so the domain differs for every test
 export DELETE_ACCOUNT_BETWEEN_STEPS_IN_NAMESPACE=${PROJECT}
 
-
 tmpFile=$( mktemp )
 
 timeout 10m oc rollout status deploy/openshift-acme
 
-make -j64 test-extended GOFLAGS="-v -race"
+make -j64 test-extended GOFLAGS="-v"

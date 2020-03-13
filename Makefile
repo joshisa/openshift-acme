@@ -12,7 +12,6 @@ PROJECT?=acme-controller
 
 # we intentionaly don't specify this value because test are making changes to the cluster so we wan't user to configure it explicitely
 GO_ET_KUBECONFIG :="<unspecified>"
-TEST_FLAGS :=
 GO_ET_DOMAIN :=""
 
 # Include the library makefile
@@ -48,8 +47,8 @@ update: update-deploy-files
 .PHONY: update
 
 
-test-extended:
-	go test $(GOFLAGS) ./test/e2e/openshift -args $(TEST_FLAGS)
+test-extended: GO_TEST_PACKAGES:=./test/e2e/openshift
+test-extended: test-unit
 .PHONY: test-extended
 
 test-e2e-cluster-wide:
